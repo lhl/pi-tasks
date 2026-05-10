@@ -315,6 +315,47 @@ describe("TaskWidget", () => {
     const entry = ui.state.widgets.get("tasks");
     expect(entry?.options?.placement).toBe("aboveEditor");
   });
+
+  it("prioritizes active tasks when the widget overflows", () => {
+    for (let i = 0; i < 10; i++) {
+      store.create(`Done ${i + 1}`, "Desc");
+      store.update(String(i + 1), { status: "completed" });
+    }
+    store.create("Actually active", "Desc", "Working actively");
+    store.update("11", { status: "in_progress" });
+    widget.setActiveTask("11", true);
+
+    const lines = renderWidget(ui.state);
+    expect(lines.some(line => line.includes("Working actively…"))).toBe(true);
+    expect(lines.some(line => line.includes("Done 10"))).toBe(false);
+    expect(lines[lines.length - 1]).toContain("more");
+  });
+
+  it("persists completed task stats after execution finishes", () => {
+    vi.setSystemTime(new Date("2026-04-13T15:04:00Z"));
+    store.create("Finished task", "Desc", "Working");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+
+    widget.addTokenUsage(1500, 800);
+    vi.advanceTimersByTime(65_000);
+
+    store.update("1", { status: "completed" });
+    widget.setActiveTask("1", false);
+
+    const task = store.get("1")!;
+    expect(task.metadata.executionStats).toMatchObject({
+      durationMs: 65_000,
+      inputTokens: 1500,
+      outputTokens: 800,
+    });
+
+    const lines = renderWidget(ui.state);
+    expect(lines[1]).toContain("~~#1 Finished task~~");
+    expect(lines[1]).toContain("1m 5s");
+    expect(lines[1]).toContain("↑ 1.5k");
+    expect(lines[1]).toContain("↓ 800");
+  });
 });
 
 describe("formatDuration (via widget rendering)", () => {

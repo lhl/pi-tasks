@@ -12,7 +12,7 @@ describe("auto-clear: on_task_complete mode", () => {
     manager = new AutoClearManager(() => store, () => "on_task_complete");
   });
 
-  it("does not clear completed task before REMINDER_INTERVAL turns", () => {
+  it("does not clear completed task before the configured turn delay", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
@@ -25,12 +25,12 @@ describe("auto-clear: on_task_complete mode", () => {
     expect(store.get("1")!.status).toBe("completed");
   });
 
-  it("clears completed task after REMINDER_INTERVAL turns", () => {
+  it("clears completed task after the configured turn delay", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
 
-    // Turn 5 = turn 1 + 4 (REMINDER_INTERVAL)
+    // Turn 5 = turn 1 + 4 turn delay
     manager.onTurnStart(5);
     expect(store.get("1")).toBeUndefined();
     expect(store.list()).toHaveLength(0);
@@ -82,13 +82,13 @@ describe("auto-clear: on_task_complete mode", () => {
     expect(store.get("2")!.blockedBy).toEqual([]);
   });
 
-  it("returns true when tasks are cleared", () => {
+  it("returns cleared IDs when tasks are cleared", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
 
-    expect(manager.onTurnStart(4)).toBe(false);
-    expect(manager.onTurnStart(5)).toBe(true);
+    expect(manager.onTurnStart(4)).toEqual({ cleared: false, ids: [] });
+    expect(manager.onTurnStart(5)).toEqual({ cleared: true, ids: ["1"] });
   });
 });
 
@@ -128,7 +128,7 @@ describe("auto-clear: on_list_complete mode", () => {
     expect(store.list()).toHaveLength(2);
   });
 
-  it("clears all completed tasks after REMINDER_INTERVAL turns when all are completed", () => {
+  it("clears all completed tasks after the configured turn delay when all are completed", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { status: "completed" });
@@ -139,7 +139,7 @@ describe("auto-clear: on_list_complete mode", () => {
     expect(store.list()).toHaveLength(0);
   });
 
-  it("resets countdown when a new task is created before REMINDER_INTERVAL", () => {
+  it("resets countdown when a new task is created before the turn delay", () => {
     store.create("A", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
@@ -171,13 +171,13 @@ describe("auto-clear: on_list_complete mode", () => {
     expect(store.list()).toHaveLength(2); // both still here
   });
 
-  it("returns true when tasks are cleared", () => {
+  it("returns cleared IDs when tasks are cleared", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
 
-    expect(manager.onTurnStart(4)).toBe(false);
-    expect(manager.onTurnStart(5)).toBe(true);
+    expect(manager.onTurnStart(4)).toEqual({ cleared: false, ids: [] });
+    expect(manager.onTurnStart(5)).toEqual({ cleared: true, ids: ["1"] });
   });
 });
 

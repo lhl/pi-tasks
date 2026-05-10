@@ -16,6 +16,7 @@ const LOCK_MAX_RETRIES = 100; // 5s max
 
 /** Simple file-based locking. */
 function acquireLock(lockPath: string): void {
+  ensureDir(lockPath);
   for (let i = 0; i < LOCK_MAX_RETRIES; i++) {
     try {
       // O_EXCL: fail if file exists
@@ -50,9 +51,14 @@ function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function ensureDir(filePath: string): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+}
+
 export class TaskStore {
   private filePath: string | undefined;
   private lockPath: string | undefined;
+  public onCorruptFile?: (filePath: string, error: unknown) => void;
 
   // In-memory state (always kept in sync)
   private nextId = 1;
@@ -62,7 +68,7 @@ export class TaskStore {
     if (!listIdOrPath) return;
     const isAbsPath = isAbsolute(listIdOrPath);
     const filePath = isAbsPath ? listIdOrPath : join(TASKS_DIR, `${listIdOrPath}.json`);
-    mkdirSync(dirname(filePath), { recursive: true });
+    ensureDir(filePath);
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
     this.load();
@@ -79,12 +85,17 @@ export class TaskStore {
       for (const t of data.tasks) {
         this.tasks.set(t.id, t);
       }
-    } catch { /* corrupt file — start fresh */ }
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return;
+      this.onCorruptFile?.(this.filePath, err);
+      // Preserve current in-memory state; the next successful save heals the file.
+    }
   }
 
   /** Write store to disk atomically (file-backed mode only). */
   private save(): void {
     if (!this.filePath) return;
+    ensureDir(this.filePath);
     const data: TaskStoreData = {
       nextId: this.nextId,
       tasks: Array.from(this.tasks.values()),
@@ -106,6 +117,31 @@ export class TaskStore {
     } finally {
       releaseLock(this.lockPath);
     }
+  }
+
+  createMany(items: Array<{ subject: string; description: string; activeForm?: string; metadata?: Record<string, any> }>): Task[] {
+    return this.withLock(() => {
+      const now = Date.now();
+      const created: Task[] = [];
+      for (const item of items) {
+        const task: Task = {
+          id: String(this.nextId++),
+          subject: item.subject,
+          description: item.description,
+          status: "pending",
+          activeForm: item.activeForm,
+          owner: undefined,
+          metadata: item.metadata ?? {},
+          blocks: [],
+          blockedBy: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.tasks.set(task.id, task);
+        created.push(task);
+      }
+      return created;
+    });
   }
 
   create(subject: string, description: string, activeForm?: string, metadata?: Record<string, any>): Task {
@@ -149,10 +185,10 @@ export class TaskStore {
     metadata?: Record<string, any>;
     addBlocks?: string[];
     addBlockedBy?: string[];
-  }): { task: Task | undefined; changedFields: string[]; warnings: string[] } {
+  }): { task: Task | undefined; changedFields: string[]; warnings: string[]; notFound: boolean } {
     return this.withLock(() => {
       const task = this.tasks.get(id);
-      if (!task) return { task: undefined, changedFields: [], warnings: [] };
+      if (!task) return { task: undefined, changedFields: [], warnings: [], notFound: true };
 
       const changedFields: string[] = [];
       const warnings: string[] = [];
@@ -165,7 +201,7 @@ export class TaskStore {
           t.blocks = t.blocks.filter(bid => bid !== id);
           t.blockedBy = t.blockedBy.filter(bid => bid !== id);
         }
-        return { task: undefined, changedFields: ["deleted"], warnings: [] };
+        return { task: undefined, changedFields: ["deleted"], warnings: [], notFound: false };
       }
 
       if (fields.status !== undefined) {
@@ -247,7 +283,7 @@ export class TaskStore {
       }
 
       task.updatedAt = Date.now();
-      return { task, changedFields, warnings };
+      return { task, changedFields, warnings, notFound: false };
     });
   }
 

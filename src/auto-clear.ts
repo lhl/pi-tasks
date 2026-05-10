@@ -2,10 +2,10 @@
  * auto-clear.ts — Turn-based auto-clearing of completed tasks.
  *
  * Two modes:
- * - "on_task_complete": each completed task gets its own REMINDER_INTERVAL countdown, deleted individually
+ * - "on_task_complete": each completed task gets its own turn-delay countdown, deleted individually
  * - "on_list_complete": countdown starts when ALL tasks are completed, cleared as a batch
  *
- * Both use the same turn delay (REMINDER_INTERVAL) for consistency.
+ * Both use the same turn delay for consistency.
  */
 
 import type { TaskStore } from "./task-store.js";
@@ -25,7 +25,7 @@ export class AutoClearManager {
     private clearDelayTurns = 4,
   ) {}
 
-  /** Record a task completion. Call AFTER cascade logic. */
+  /** Record a task completion. Call after any auto-continue scheduling. */
   trackCompletion(taskId: string, currentTurn: number): void {
     const mode = this.getMode();
     if (mode === "never") return;
@@ -60,11 +60,11 @@ export class AutoClearManager {
 
   /**
    * Called on each turn start. Deletes tasks whose linger period has expired.
-   * Returns true if any tasks were cleared.
+   * Returns whether tasks were cleared and which IDs disappeared.
    */
-  onTurnStart(currentTurn: number): boolean {
+  onTurnStart(currentTurn: number): { cleared: boolean; ids: string[] } {
     const mode = this.getMode();
-    let cleared = false;
+    const ids: string[] = [];
 
     if (mode === "on_task_complete") {
       for (const [taskId, turn] of this.completedAtTurn) {
@@ -75,17 +75,17 @@ export class AutoClearManager {
         } else if (currentTurn - turn >= this.clearDelayTurns) {
           this.getStore().delete(taskId);
           this.completedAtTurn.delete(taskId);
-          cleared = true;
+          ids.push(taskId);
         }
       }
     } else if (mode === "on_list_complete" && this.allCompletedAtTurn !== null) {
       if (currentTurn - this.allCompletedAtTurn >= this.clearDelayTurns) {
+        ids.push(...this.getStore().list().filter(t => t.status === "completed").map(t => t.id));
         this.getStore().clearCompleted();
         this.allCompletedAtTurn = null;
-        cleared = true;
       }
     }
 
-    return cleared;
+    return { cleared: ids.length > 0, ids };
   }
 }

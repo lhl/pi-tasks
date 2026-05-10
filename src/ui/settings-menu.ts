@@ -6,8 +6,8 @@
  * own settings panel style.
  */
 
-import { getSettingsListTheme } from "@mariozechner/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Spacer, Text } from "@mariozechner/pi-tui";
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { saveTasksConfig, type TasksConfig } from "../tasks-config.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -42,10 +42,10 @@ export async function openSettingsMenu(
       },
       {
         id: "autoCascade",
-        label: "Auto-execute with agents",
+        label: "Auto-continue with prompts",
         description:
-          "When ON: pending agent tasks start automatically once their dependencies complete. " +
-          "When OFF: use TaskExecute to launch them manually.",
+          "When ON: the next open unblocked task is queued as a follow-up prompt after task completion or agent idle. " +
+          "When OFF: use TaskExecute or a manual prompt to continue tasks.",
         currentValue: (cfg.autoCascade ?? false) ? "on" : "off",
         values: ["on", "off"],
       },

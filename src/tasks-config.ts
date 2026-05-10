@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 
 export interface TasksConfig {
   taskScope?: "memory" | "session" | "project";  // default: "session"
-  autoCascade?: boolean;   // default: false
+  autoCascade?: boolean;   // default: false; auto-continue open tasks via follow-up prompts
   autoClearCompleted?: "never" | "on_list_complete" | "on_task_complete";  // default: "on_list_complete"
 }
 

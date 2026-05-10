@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -412,5 +412,113 @@ describe("TaskStore (absolute path)", () => {
 
     const raw = JSON.parse(readFileSync(absFilePath, "utf-8"));
     expect(raw.tasks).toHaveLength(2);
+  });
+});
+
+describe("TaskStore createMany", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = new TaskStore();
+  });
+
+  it("creates multiple tasks with sequential IDs", () => {
+    const created = store.createMany([
+      { subject: "Task A", description: "Desc A" },
+      { subject: "Task B", description: "Desc B" },
+      { subject: "Task C", description: "Desc C" },
+    ]);
+
+    expect(created).toHaveLength(3);
+    expect(created.map(t => t.id)).toEqual(["1", "2", "3"]);
+    expect(created.map(t => t.subject)).toEqual(["Task A", "Task B", "Task C"]);
+    expect(store.list()).toHaveLength(3);
+  });
+
+  it("sets status to pending for all created tasks", () => {
+    const created = store.createMany([
+      { subject: "A", description: "D" },
+      { subject: "B", description: "D" },
+    ]);
+    expect(created.every(t => t.status === "pending")).toBe(true);
+  });
+
+  it("preserves activeForm and metadata per task", () => {
+    const created = store.createMany([
+      { subject: "A", description: "D", activeForm: "Doing A", metadata: { key: "val" } },
+      { subject: "B", description: "D" },
+    ]);
+    expect(created[0].activeForm).toBe("Doing A");
+    expect(created[0].metadata).toEqual({ key: "val" });
+    expect(created[1].activeForm).toBeUndefined();
+    expect(created[1].metadata).toEqual({});
+  });
+
+  it("continues ID counter from existing tasks", () => {
+    store.create("Existing", "Desc");
+    const created = store.createMany([
+      { subject: "Bulk A", description: "D" },
+      { subject: "Bulk B", description: "D" },
+    ]);
+    expect(created.map(t => t.id)).toEqual(["2", "3"]);
+  });
+
+  it("returns empty array for empty input", () => {
+    const created = store.createMany([]);
+    expect(created).toEqual([]);
+    expect(store.list()).toHaveLength(0);
+  });
+});
+
+describe("TaskStore durability safeguards", () => {
+  it("returns notFound: true for unknown update IDs", () => {
+    const store = new TaskStore();
+    const result = store.update("999", { status: "completed" });
+    expect(result.notFound).toBe(true);
+    expect(result.changedFields).toEqual([]);
+  });
+
+  it("returns notFound: false for successful updates and deletions", () => {
+    const store = new TaskStore();
+    store.create("Task", "Desc");
+    expect(store.update("1", { status: "in_progress" }).notFound).toBe(false);
+    expect(store.update("1", { status: "deleted" }).notFound).toBe(false);
+  });
+
+  it("preserves in-memory state and reports corrupt file reads", () => {
+    const filePath = join(tmpdir(), `pi-tasks-corrupt-${Date.now()}.json`);
+    try {
+      const store = new TaskStore(filePath);
+      store.create("Keep me", "Desc");
+      writeFileSync(filePath, "{not json");
+
+      const corruptCalls: Array<{ filePath: string; error: unknown }> = [];
+      store.onCorruptFile = (fp, err) => corruptCalls.push({ filePath: fp, error: err });
+
+      expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+      expect(corruptCalls).toHaveLength(1);
+      expect(corruptCalls[0].filePath).toBe(filePath);
+    } finally {
+      try { rmSync(filePath); } catch {}
+      try { rmSync(filePath + ".lock"); } catch {}
+      try { rmSync(filePath + ".tmp"); } catch {}
+    }
+  });
+
+  it("recreates missing task directories before saving", () => {
+    const dir = join(tmpdir(), `pi-tasks-missing-dir-${Date.now()}`);
+    const filePath = join(dir, "tasks.json");
+    try {
+      const store = new TaskStore(filePath);
+      store.create("First", "Desc");
+      rmSync(dir, { recursive: true, force: true });
+
+      store.update("1", { status: "completed" });
+
+      const restored = new TaskStore(filePath);
+      expect(restored.get("1")!.status).toBe("completed");
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
   });
 });

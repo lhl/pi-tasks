@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TaskCreateMany** — batch-create multiple tasks in one tool call.
+- **Prompt-injected task execution** — `TaskExecute` now queues follow-up user prompts in the current session instead of spawning subagents.
+- **Auto-continue with prompts** — optional setting queues the next open unblocked task after completion or agent idle, with a per-task attempt cap.
+- **Persisted task execution stats** — task start time, duration, and token usage are stored in task metadata and rendered in `TaskGet`/the widget.
+
+### Changed
+- **Removed system-reminder injection** — task tools no longer append periodic `<system-reminder>` text to unrelated tool results.
+- **Widget overflow prioritizes active work** — when the task list overflows, in-progress and pending tasks stay visible before completed tasks.
+- **Updated pi dependencies** — imports and peer/dev dependencies now use `@earendil-works/*` and `@sinclair/typebox`.
+
+### Fixed
+- **Task store durability** — missing task directories are recreated before save, corrupt file reads preserve in-memory state and report via `onCorruptFile`, and `TaskStore.update()` distinguishes missing IDs with `notFound`.
+- **Auto-clear reporting** — auto-clear now returns the IDs it removed.
+
 ## [0.5.0] - 2026-04-28
 
 ### Changed

@@ -8,8 +8,9 @@
  *   ✳/✽ actively executing task (star spinner with activeForm text)
  */
 
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { TaskStore } from "../task-store.js";
+import { isCompletedTaskExecutionStats, isTaskExecutionStats, type Task, type TaskExecutionStats } from "../types.js";
 
 // ---- Types ----
 
@@ -58,6 +59,27 @@ function formatTokens(n: number): string {
   return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
 }
 
+/** Format a stable, human-readable clock time with second precision. */
+function formatClockTime(ms: number): string {
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(ms);
+}
+
+function formatLiveStats(theme: Theme, metrics: TaskMetrics | undefined): string {
+  if (!metrics) return "";
+
+  const elapsed = formatDuration(Date.now() - metrics.startedAt);
+  const tokenParts: string[] = [];
+  if (metrics.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(metrics.inputTokens)}`);
+  if (metrics.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(metrics.outputTokens)}`);
+
+  const statParts = [`started ${formatClockTime(metrics.startedAt)}`, elapsed, ...tokenParts];
+  return ` ${theme.fg("dim", `(${statParts.join(" · ")})`)}`;
+}
+
 // ---- Widget ----
 
 export class TaskWidget {
@@ -83,16 +105,130 @@ export class TaskWidget {
     this.uiCtx = ctx;
   }
 
+  /** Persist the fact that a task started even before it completes. */
+  private persistStartMetrics(taskId: string, startedAt: number, existingStats?: TaskExecutionStats) {
+    this.store.update(taskId, {
+      metadata: {
+        executionStats: {
+          ...existingStats,
+          startedAt,
+          inputTokens: existingStats?.inputTokens ?? 0,
+          outputTokens: existingStats?.outputTokens ?? 0,
+        },
+      },
+    });
+  }
+
+  /** Infer a reasonable execution window for completed tasks that missed live tracking. */
+  private inferCompletedStats(task: Task, metrics?: TaskMetrics): Required<TaskExecutionStats> {
+    const existingStats = isTaskExecutionStats(task.metadata?.executionStats)
+      ? task.metadata.executionStats
+      : undefined;
+    if (metrics) {
+      const startedAt = existingStats?.startedAt ?? metrics.startedAt;
+      const completedAt = existingStats?.completedAt ?? task.updatedAt;
+      return {
+        startedAt,
+        completedAt,
+        durationMs: Math.max(0, completedAt - startedAt),
+        inputTokens: metrics.inputTokens,
+        outputTokens: metrics.outputTokens,
+      };
+    }
+    if (isCompletedTaskExecutionStats(existingStats)) return existingStats;
+
+    const blockerCompletedAt = task.blockedBy
+      .map((id) => this.store.get(id))
+      .flatMap((blocker) => {
+        if (!blocker || blocker.status !== "completed") return [];
+        const blockerStats = isTaskExecutionStats(blocker.metadata?.executionStats)
+          ? blocker.metadata.executionStats
+          : undefined;
+        return [blockerStats?.completedAt ?? blocker.updatedAt];
+      });
+    const startedAt = Math.max(task.createdAt, ...blockerCompletedAt);
+    return {
+      startedAt,
+      completedAt: task.updatedAt,
+      durationMs: Math.max(0, task.updatedAt - startedAt),
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+  }
+
+  /** Persist live metrics into task metadata when execution completes. */
+  private persistMetrics(taskId: string, task?: Task) {
+    const m = this.metrics.get(taskId);
+    const existingStats = isTaskExecutionStats(task?.metadata?.executionStats)
+      ? task.metadata.executionStats
+      : undefined;
+
+    if (task?.status === "completed" && (!isCompletedTaskExecutionStats(existingStats) || m)) {
+      this.store.update(taskId, { metadata: { executionStats: this.inferCompletedStats(task, m) } });
+    }
+
+    if (m) this.metrics.delete(taskId);
+  }
+
+  /** Rebuild timing baselines for persisted in-progress tasks after startup/resume. */
+  private syncTrackedTasks(tasks = this.store.list()) {
+    for (const task of tasks) {
+      if (task.status === "in_progress" && !this.metrics.has(task.id)) {
+        const existingStats = isTaskExecutionStats(task.metadata?.executionStats)
+          ? task.metadata.executionStats
+          : undefined;
+        const startedAt = existingStats?.startedAt ?? task.updatedAt;
+        this.metrics.set(task.id, {
+          startedAt,
+          inputTokens: existingStats?.inputTokens ?? 0,
+          outputTokens: existingStats?.outputTokens ?? 0,
+        });
+        if (!existingStats) this.persistStartMetrics(task.id, startedAt);
+      }
+    }
+
+    for (const [id] of this.metrics) {
+      const task = tasks.find(t => t.id === id) ?? this.store.get(id);
+      if (!task) {
+        this.activeTaskIds.delete(id);
+        this.metrics.delete(id);
+        continue;
+      }
+      if (task.status !== "in_progress") {
+        this.activeTaskIds.delete(id);
+        this.persistMetrics(id, task);
+      }
+    }
+
+    for (const task of tasks) {
+      if (task.status === "completed" && !isCompletedTaskExecutionStats(task.metadata?.executionStats)) {
+        this.store.update(task.id, { metadata: { executionStats: this.inferCompletedStats(task) } });
+      }
+    }
+  }
+
   /** Add or remove a task from the active spinner set. */
   setActiveTask(taskId: string | undefined, active = true) {
     if (taskId && active) {
       this.activeTaskIds.add(taskId);
+      const task = this.store.get(taskId);
+      const existingStats = isTaskExecutionStats(task?.metadata?.executionStats)
+        ? task.metadata.executionStats
+        : undefined;
       if (!this.metrics.has(taskId)) {
-        this.metrics.set(taskId, { startedAt: Date.now(), inputTokens: 0, outputTokens: 0 });
+        const startedAt = existingStats?.startedAt ?? Date.now();
+        this.metrics.set(taskId, {
+          startedAt,
+          inputTokens: existingStats?.inputTokens ?? 0,
+          outputTokens: existingStats?.outputTokens ?? 0,
+        });
+        if (!existingStats) this.persistStartMetrics(taskId, startedAt);
       }
       this.ensureTimer();
     } else if (taskId) {
       this.activeTaskIds.delete(taskId);
+      const task = this.store.get(taskId);
+      this.persistMetrics(taskId, task);
     }
     this.update();
   }
@@ -137,9 +273,11 @@ export class TaskWidget {
     const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
     const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
 
-    const visible = tasks.slice(0, MAX_VISIBLE_TASKS);
-    for (let i = 0; i < visible.length; i++) {
-      const task = visible[i];
+    const visibleSource = tasks.length > MAX_VISIBLE_TASKS
+      ? [...inProgress, ...pending, ...completed]
+      : tasks;
+    const visible = visibleSource.slice(0, MAX_VISIBLE_TASKS);
+    for (const task of visible) {
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
 
       let icon: string;
@@ -167,34 +305,35 @@ export class TaskWidget {
       let text: string;
       if (isActive) {
         const form = task.activeForm || task.subject;
-        const agentId = task.metadata?.agentId;
-        const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
-        const m = this.metrics.get(task.id);
-        let stats = "";
-        if (m) {
-          const elapsed = formatDuration(Date.now() - m.startedAt);
-          const tokenParts: string[] = [];
-          if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
-          if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
-          stats = tokenParts.length > 0
-            ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
-            : ` ${theme.fg("dim", `(${elapsed})`)}`;
-        }
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
+        const stats = formatLiveStats(theme, this.metrics.get(task.id));
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + "…")}${stats}`;
       } else if (task.status === "completed") {
-        text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
+        const stats = isCompletedTaskExecutionStats(task.metadata.executionStats)
+          ? task.metadata.executionStats
+          : undefined;
+        const statParts = stats
+          ? [
+            `started ${formatClockTime(stats.startedAt)}`,
+            `ended ${formatClockTime(stats.completedAt)}`,
+            formatDuration(stats.durationMs),
+            ...(stats.inputTokens > 0 ? [`↑ ${formatTokens(stats.inputTokens)}`] : []),
+            ...(stats.outputTokens > 0 ? [`↓ ${formatTokens(stats.outputTokens)}`] : []),
+          ]
+          : [];
+        const statSuffix = statParts.length > 0 ? ` ${theme.fg("dim", `(${statParts.join(" · ")})`)}` : "";
+        text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}${statSuffix}`;
       } else {
-        const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
-          ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
+        const stats = task.status === "in_progress"
+          ? formatLiveStats(theme, this.metrics.get(task.id))
           : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${stats}`;
       }
 
       lines.push(truncate(text + suffix));
     }
 
-    if (tasks.length > MAX_VISIBLE_TASKS) {
-      lines.push(truncate(theme.fg("dim", `    … and ${tasks.length - MAX_VISIBLE_TASKS} more`)));
+    if (visibleSource.length > MAX_VISIBLE_TASKS) {
+      lines.push(truncate(theme.fg("dim", `    … and ${visibleSource.length - MAX_VISIBLE_TASKS} more`)));
     }
 
     return lines;
@@ -204,6 +343,7 @@ export class TaskWidget {
   update() {
     if (!this.uiCtx) return;
     const tasks = this.store.list();
+    this.syncTrackedTasks(tasks);
 
     // Transition: visible → hidden
     if (tasks.length === 0) {
@@ -219,11 +359,12 @@ export class TaskWidget {
     }
 
     // Prune stale active IDs (deleted or no longer in_progress)
+    const taskMap = new Map(tasks.map(t => [t.id, t]));
     for (const id of this.activeTaskIds) {
-      const t = this.store.get(id);
+      const t = taskMap.get(id);
       if (!t || t.status !== "in_progress") {
         this.activeTaskIds.delete(id);
-        this.metrics.delete(id);
+        this.persistMetrics(id, t);
       }
     }
 
