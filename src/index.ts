@@ -1,5 +1,6 @@
 /**
- * @tintinweb/pi-tasks — A pi extension providing Claude Code-style task tracking and coordination.
+ * @lhl/pi-tasks — A pi extension providing Claude Code-style task tracking and coordination.
+ *               Fork of @tintinweb/pi-tasks with an interactive auto-advance mode.
  *
  * Tools:
  *   TaskCreate     — Create a structured task
@@ -21,7 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
 import { TaskStore } from "./task-store.js";
-import { loadTasksConfig } from "./tasks-config.js";
+import { type AutoMode, getAutoMode, loadTasksConfig, saveTasksConfig } from "./tasks-config.js";
 import { isCompletedTaskExecutionStats, isTaskExecutionStats, type Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
@@ -113,6 +114,15 @@ export default function (pi: ExtensionAPI) {
   const queuedTaskIds = new Set<string>();
   /** Guardrail to prevent runaway auto-continue loops on the same unfinished task. */
   const autoPromptAttempts = new Map<string, number>();
+  /** Re-entrancy guard for the interactive auto-mode prompt. */
+  let autoAskInFlight = false;
+
+  /** Apply a new auto-advance mode and persist it; clears the legacy flag. */
+  function setAutoMode(mode: AutoMode): void {
+    cfg.autoMode = mode;
+    if ("autoCascade" in cfg) delete cfg.autoCascade;
+    saveTasksConfig(cfg);
+  }
 
   function getOpenBlockers(task: Pick<Task, "blockedBy">): string[] {
     return task.blockedBy.filter(depId => store.get(depId)?.status !== "completed");
@@ -209,7 +219,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function queueNextOpenTask(reason: string): { queued: boolean; message: string } | undefined {
-    if (!(cfg.autoCascade ?? false)) return undefined;
+    if (getAutoMode(cfg) === "off") return undefined;
 
     const promptedInProgress = store.list().some(t => t.status === "in_progress" && queuedTaskIds.has(t.id));
     if (promptedInProgress) return undefined;
@@ -220,6 +230,108 @@ export default function (pi: ExtensionAPI) {
       additionalContext: promptExecutionConfig.additionalContext,
       reason,
     });
+  }
+
+  /**
+   * In auto mode, ask the user what to do with an in_progress task that the
+   * agent left open at idle. Returns whether the auto loop should continue.
+   */
+  async function askAutoAction(ctx: ExtensionContext, task: Task): Promise<"continue" | "stop"> {
+    const labelComplete = "✓ Mark complete";
+    const labelContinue = "▸ Continue (re-queue this task)";
+    const labelStop = "✗ Stop auto mode";
+
+    const title = `Task #${task.id} still in progress: ${task.subject}`;
+    let choice: string | undefined;
+    try {
+      choice = await ctx.ui.select(title, [labelComplete, labelContinue, labelStop]);
+    } catch (err: any) {
+      debug("auto-mode ui.select failed", err?.message ?? err);
+      return "stop";
+    }
+
+    if (!choice || choice === labelStop) {
+      setAutoMode("off");
+      ctx.ui.notify("Auto mode stopped.", "info");
+      return "stop";
+    }
+
+    if (choice === labelComplete) {
+      store.update(task.id, { status: "completed" });
+      queuedTaskIds.delete(task.id);
+      autoPromptAttempts.delete(task.id);
+      autoClear.trackCompletion(task.id, currentTurn);
+      widget.setActiveTask(task.id, false);
+      widget.update();
+      ctx.ui.notify(`Marked task #${task.id} complete.`, "info");
+      return "continue";
+    }
+
+    if (choice === labelContinue) {
+      // Reset attempt counter so the user-initiated retry is not rate-limited.
+      autoPromptAttempts.delete(task.id);
+      queuedTaskIds.delete(task.id);
+      const result = queueTaskPrompt(task, {
+        additionalContext: promptExecutionConfig.additionalContext,
+        explicit: true,
+        reason: "auto_continue",
+      });
+      if (!result.queued) {
+        ctx.ui.notify(result.message, "warning");
+      }
+      // We already queued the task; let it run before the next advance.
+      return "stop";
+    }
+
+    return "stop";
+  }
+
+  /**
+   * Drive the auto-advance loop after an agent idle event.
+   * In cascade mode this just re-queues the next open task. In auto mode it
+   * interactively prompts the user about any in_progress task and only then
+   * advances to the next pending task.
+   */
+  async function autoAdvance(ctx: ExtensionContext, reason: string): Promise<void> {
+    if (autoAskInFlight) return;
+    const mode = getAutoMode(cfg);
+    if (mode === "off") return;
+
+    const tasks = store.list();
+    const open = tasks.filter(t => t.status !== "completed");
+
+    if (open.length === 0) {
+      if (mode === "auto") {
+        setAutoMode("off");
+        ctx.ui.notify("Auto mode finished — all tasks complete.", "info");
+      }
+      return;
+    }
+
+    if (mode === "cascade") {
+      queueNextOpenTask(reason);
+      return;
+    }
+
+    // mode === "auto"
+    const inProgress = tasks.find(t => t.status === "in_progress" && getOpenBlockers(t).length === 0);
+    if (inProgress) {
+      autoAskInFlight = true;
+      let outcome: "continue" | "stop";
+      try {
+        outcome = await askAutoAction(ctx, inProgress);
+      } finally {
+        autoAskInFlight = false;
+      }
+      if (outcome === "continue") {
+        // Loop around in case the user marked the task complete — advance further.
+        await autoAdvance(ctx, `${reason}_after_ask`);
+      }
+      return;
+    }
+
+    // No in_progress unblocked task. Pull the next pending task.
+    queueNextOpenTask(reason);
   }
 
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
@@ -331,8 +443,20 @@ export default function (pi: ExtensionAPI) {
     widget.update();
   });
 
-  pi.on("agent_end", async () => {
-    queueNextOpenTask("agent_end");
+  pi.on("agent_end", async (_event, ctx) => {
+    if (ctx) {
+      latestCtx = ctx;
+      widget.setUICtx(ctx.ui as UICtx);
+    }
+    const ctxForUI = ctx ?? latestCtx;
+    const mode = getAutoMode(cfg);
+    if (mode === "off") return;
+    if (mode === "auto" && ctxForUI) {
+      await autoAdvance(ctxForUI, "agent_end");
+    } else {
+      // Cascade (or auto without a usable UI ctx) — fall back to silent queueing.
+      queueNextOpenTask("agent_end");
+    }
   });
 
   // ──────────────────────────────────────────────────
@@ -950,20 +1074,86 @@ ${results.join("\n")}`);
   // /tasks command
   // ──────────────────────────────────────────────────
 
+  /** Parse '/tasks auto [on|off|cascade|status]' style args. */
+  function parseAutoArg(raw: string | undefined): "on" | "off" | "cascade" | "status" | undefined {
+    const v = (raw ?? "").trim().toLowerCase();
+    if (v === "" || v === "on" || v === "auto") return "on";
+    if (v === "off" || v === "stop" || v === "disable") return "off";
+    if (v === "cascade") return "cascade";
+    if (v === "status" || v === "?") return "status";
+    return undefined;
+  }
+
   pi.registerCommand("tasks", {
-    description: "Manage tasks — view, create, clear completed",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+    description: "Manage tasks — view, create, clear completed. '/tasks auto' enters auto-advance mode.",
+    getArgumentCompletions: (prefix: string) => {
+      const completions = ["auto", "auto off", "auto cascade", "auto status"];
+      const matches = completions
+        .filter(v => v.startsWith(prefix.toLowerCase()))
+        .map(v => ({ value: v, label: v }));
+      return matches.length > 0 ? matches : null;
+    },
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       const ui = ctx.ui;
+      const trimmed = (args ?? "").trim();
+
+      // ── /tasks auto [...] subcommand ──
+      if (trimmed.toLowerCase().startsWith("auto")) {
+        const sub = parseAutoArg(trimmed.slice("auto".length));
+        if (!sub) {
+          ui.notify(
+            `Usage: /tasks auto [on|off|cascade|status]. Current mode: ${getAutoMode(cfg)}.`,
+            "warning",
+          );
+          return;
+        }
+
+        if (sub === "status") {
+          ui.notify(`Auto-advance mode: ${getAutoMode(cfg)}.`, "info");
+          return;
+        }
+
+        const newMode: AutoMode = sub === "on" ? "auto" : sub === "cascade" ? "cascade" : "off";
+        setAutoMode(newMode);
+
+        if (newMode === "off") {
+          ui.notify("Auto-advance mode disabled.", "info");
+          return;
+        }
+
+        ui.notify(
+          newMode === "auto"
+            ? "Auto mode on — will advance through open tasks and ask you about anything still in progress."
+            : "Cascade mode on — will silently queue the next open task after each completion.",
+          "info",
+        );
+
+        // Kick the loop immediately so the user sees progress without waiting for the next idle.
+        if (newMode === "auto") {
+          await autoAdvance(ctx as unknown as ExtensionContext, "tasks_auto_command");
+        } else {
+          const result = queueNextOpenTask("tasks_cascade_command");
+          if (result?.queued) ui.notify(result.message, "info");
+        }
+        return;
+      }
 
       const mainMenu = async (): Promise<void> => {
         const tasks = store.list();
         const taskCount = tasks.length;
         const completedCount = tasks.filter(t => t.status === "completed").length;
+        const openCount = tasks.filter(t => t.status !== "completed").length;
+        const mode = getAutoMode(cfg);
 
         const choices: string[] = [
           `View all tasks (${taskCount})`,
           "Create task",
         ];
+        if (mode === "off" && openCount > 0) {
+          choices.push("Start auto mode");
+        } else if (mode !== "off") {
+          choices.push(`Stop auto mode (currently ${mode})`);
+        }
         if (completedCount > 0) choices.push(`Clear completed (${completedCount})`);
         if (taskCount > 0) choices.push(`Clear all (${taskCount})`);
         choices.push("Settings");
@@ -977,6 +1167,17 @@ ${results.join("\n")}`);
           await createTask();
         } else if (choice === "Settings") {
           await settingsMenu();
+        } else if (choice === "Start auto mode") {
+          setAutoMode("auto");
+          ui.notify(
+            "Auto mode on — will advance through open tasks and ask you about anything still in progress.",
+            "info",
+          );
+          await autoAdvance(ctx as unknown as ExtensionContext, "tasks_menu_start_auto");
+        } else if (choice.startsWith("Stop auto mode")) {
+          setAutoMode("off");
+          ui.notify("Auto-advance mode disabled.", "info");
+          await mainMenu();
         } else if (choice.startsWith("Clear completed")) {
           store.clearCompleted();
           if (taskScope === "session") store.deleteFileIfEmpty();

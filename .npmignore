@@ -4,9 +4,10 @@ tsconfig.json
 .git/
 .gitignore
 
-# Documentation
+# Documentation / working notes
 PLAN.md
 SUMMARY.md
+TASK-HISTORY.md
 plan/
 media/
 

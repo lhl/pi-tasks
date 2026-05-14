@@ -8,7 +8,7 @@
 
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
-import { saveTasksConfig, type TasksConfig } from "../tasks-config.js";
+import { type AutoMode, getAutoMode, saveTasksConfig, type TasksConfig } from "../tasks-config.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -41,13 +41,15 @@ export async function openSettingsMenu(
         values: ["memory", "session", "project"],
       },
       {
-        id: "autoCascade",
-        label: "Auto-continue with prompts",
+        id: "autoMode",
+        label: "Auto-advance mode",
         description:
-          "When ON: the next open unblocked task is queued as a follow-up prompt after task completion or agent idle. " +
-          "When OFF: use TaskExecute or a manual prompt to continue tasks.",
-        currentValue: (cfg.autoCascade ?? false) ? "on" : "off",
-        values: ["on", "off"],
+          "off: never auto-queue follow-up prompts — use TaskExecute or a manual prompt. " +
+          "cascade: silently queue the next open unblocked task after a completion or agent idle (capped per task to avoid loops). " +
+          "auto: like cascade, but if a task is still in_progress at agent idle, ask the user (complete / continue / stop). " +
+          "Auto-disables once every task is complete. Trigger one-shot via '/tasks auto'.",
+        currentValue: getAutoMode(cfg),
+        values: ["off", "cascade", "auto"],
       },
       {
         id: "autoClearCompleted",
@@ -67,8 +69,10 @@ export async function openSettingsMenu(
       /* maxVisible */ 10,
       getSettingsListTheme(),
       /* onChange */ (id, newValue) => {
-        if (id === "autoCascade") {
-          cfg.autoCascade = newValue === "on";
+        if (id === "autoMode") {
+          cfg.autoMode = newValue as AutoMode;
+          // Clear the legacy boolean field so it stops shadowing the new setting.
+          if ("autoCascade" in cfg) delete cfg.autoCascade;
           saveTasksConfig(cfg);
         }
         if (id === "taskScope") {
@@ -90,6 +94,7 @@ export async function openSettingsMenu(
 
     const root = new SettingsPanel();
     root.addChild(new Text(theme.bold(theme.fg("accent", "⚙  Task Settings")), 0, 0));
+    // (Auto-advance mode can also be toggled at any time via '/tasks auto'.)
     root.addChild(new Spacer(1));
     root.addChild(list);
 

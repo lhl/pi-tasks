@@ -1,17 +1,27 @@
-# @tintinweb/pi-tasks
+# @lhl/pi-tasks
 
-A [pi](https://pi.dev) extension for structured task tracking and coordination. Track multi-step work with persistent tasks, dependency management, and a live widget.
+A [pi](https://pi.dev) extension for structured task tracking and coordination. Track multi-step work with persistent tasks, dependency management, blocker-aware auto-advance, and a live widget.
 
 > **Status:** Early release.
+>
+> **Fork notice:** This is a fork of [@tintinweb/pi-tasks](https://github.com/tintinweb/pi-tasks) maintained at [github.com/lhl/pi-tasks](https://github.com/lhl/pi-tasks). Full credit for the original extension goes to [tintinweb](https://github.com/tintinweb).
+>
+> The fork diverged from upstream `0.5.0` and has since changed a fair amount — see the [`0.6.0` CHANGELOG entry](./CHANGELOG.md) for the full list. Highlights:
+>
+> - `TaskExecute` no longer spawns subagents via `@tintinweb/pi-subagents`; it queues follow-up user prompts in the current pi session instead. The whole subagent RPC layer is removed.
+> - New **interactive auto-advance mode** (`/tasks auto`, `autoMode: "auto"`) walks the task list to completion and asks the user about anything still in progress instead of silently retrying.
+> - `TaskCreateMany`, persisted task execution stats (start/end/duration/tokens), and a hardened task store (corrupt-file callback, dir auto-heal, `notFound` results).
+> - No more `<system-reminder>` injection into unrelated tool results.
+> - Pi runtime moved to `@earendil-works/*` and `@sinclair/typebox`, peer-depended.
 
-<img width="600" alt="pi-tasks screenshot" src="https://github.com/tintinweb/pi-tasks/raw/master/media/screenshot.png" />
+<img width="600" alt="pi-tasks screenshot" src="https://github.com/lhl/pi-tasks/raw/master/media/screenshot.png" />
 
 ## Features
 
 - **8 LLM-callable tools** — `TaskCreate`, `TaskCreateMany`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute`.
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers, strikethrough for completed tasks, and a star spinner for active tasks with elapsed time and token counts.
 - **Prompt-injected task execution** — `TaskExecute` queues follow-up user prompts in the current pi session instead of launching subagents.
-- **Auto-continue mode** — when enabled, the next open unblocked task is queued automatically after task completion or when the agent becomes idle with open work.
+- **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`). `cascade` silently queues the next open unblocked task. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
 - **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references.
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for coordination.
 - **File locking** — concurrent access is safe when multiple sessions share a task list.
@@ -22,7 +32,7 @@ This fork intentionally does **not** inject periodic `<system-reminder>` message
 ## Install
 
 ```bash
-pi install npm:@tintinweb/pi-tasks
+pi install npm:@lhl/pi-tasks
 ```
 
 Or load directly for development:
@@ -30,6 +40,8 @@ Or load directly for development:
 ```bash
 pi -e ./src/index.ts
 ```
+
+Migrating from `@tintinweb/pi-tasks`? Uninstall the upstream package first (`pi uninstall @tintinweb/pi-tasks`) so only one copy is active. Existing `.pi/tasks-config.json` files are read as-is; the legacy `autoCascade: true` setting is automatically interpreted as the new `autoMode: "cascade"`.
 
 ## Widget
 
@@ -149,7 +161,15 @@ Tasks must be `pending` or `in_progress`, and all `blockedBy` dependencies must 
 
 Queued prompts instruct the agent to focus on that task, use `TaskGet` if needed, mark it `in_progress`, and mark it `completed` with an optional `metadata.result` summary when done. Dependent task prompts include completed prerequisites' `metadata.result` values when available.
 
-With **auto-continue** enabled (`/tasks` → Settings), completing a task automatically queues the next open unblocked task. If the agent becomes idle while open work remains, the extension can also queue the next task prompt. A per-task attempt cap prevents runaway repeated auto-prompts.
+**Auto-advance** (`/tasks` → Settings, or `/tasks auto`) drives the task list forward automatically:
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | Never auto-queues prompts — use `TaskExecute` or manual prompts. |
+| `cascade` | After each task completion or agent idle, silently queues the next open unblocked task. Capped to a few attempts per task to prevent runaway loops. |
+| `auto` | Same as cascade, but when a task is still `in_progress` at agent idle, asks you whether to **mark complete**, **continue** (re-queue), or **stop** auto mode. Auto-disables once every task is completed or cleared. |
+
+Dependent task prompts include completed prerequisites' `metadata.result` values when available.
 
 ## Task Lifecycle
 
@@ -178,7 +198,7 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 | `session` **(default)** | `<cwd>/.pi/tasks/tasks-<sessionId>.json` | Per-session file — isolated between sessions, survives resume |
 | `project` | `<cwd>/.pi/tasks/tasks.json` | Shared across all sessions in the project |
 
-Settings (`taskScope`, `autoCascade`, `autoClearCompleted`) are saved to `<cwd>/.pi/tasks-config.json`. The internal `autoCascade` setting powers the user-facing **Auto-continue with prompts** toggle.
+Settings (`taskScope`, `autoMode`, `autoClearCompleted`) are saved to `<cwd>/.pi/tasks-config.json`. The legacy boolean `autoCascade: true` from older versions is still read and mapped to `autoMode: "cascade"` for backward compatibility.
 
 ### Auto-clear completed tasks
 
@@ -207,6 +227,7 @@ Interactive menu:
 Tasks
 ├─ View all tasks (4)
 ├─ Create task
+├─ Start auto mode             (only when there is open work and auto mode is off)
 ├─ Clear completed (1)
 ├─ Clear all (4)
 └─ Settings
@@ -214,9 +235,29 @@ Tasks
 
 - **View all tasks** — select a task to see details and take actions (start, complete, delete).
 - **Create task** — input prompts for subject and description.
+- **Start / Stop auto mode** — toggle interactive auto-advance through the task list.
 - **Clear completed** — remove all completed tasks.
 - **Clear all** — remove all tasks regardless of status.
-- **Settings** — configure task storage, auto-continue, and auto-clear completed tasks.
+- **Settings** — configure task storage, auto-advance mode, and auto-clear completed tasks.
+
+### `/tasks auto` subcommand
+
+Flip auto-advance on or off without opening the menu:
+
+| Command | Effect |
+|---------|--------|
+| `/tasks auto` | Set mode to `auto` and immediately advance — will ask you about any in-progress task. |
+| `/tasks auto cascade` | Set mode to `cascade` (silent auto-advance with attempt cap). |
+| `/tasks auto off` | Disable auto-advance. |
+| `/tasks auto status` | Show the current mode. |
+
+In `auto` mode the extension prompts you at each agent idle with three choices:
+
+- **✓ Mark complete** — marks the in-progress task as completed and advances to the next open task.
+- **▸ Continue (re-queue this task)** — re-queues the same task as a follow-up prompt with a fresh attempt counter.
+- **✗ Stop auto mode** — sets the mode back to `off`.
+
+Auto mode automatically disables itself once every task is completed or cleared.
 
 ## Architecture
 
@@ -243,4 +284,9 @@ npm test
 
 ## License
 
-MIT — [tintinweb](https://github.com/tintinweb)
+MIT.
+
+- Original `@tintinweb/pi-tasks` © [tintinweb](https://github.com/tintinweb)
+- Fork additions © [lhl](https://github.com/lhl)
+
+See [LICENSE](LICENSE) for the full text.

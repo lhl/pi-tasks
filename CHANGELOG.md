@@ -5,22 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+> Starting at **0.6.0** this changelog tracks the fork [`@lhl/pi-tasks`](https://github.com/lhl/pi-tasks). Entries below `0.6.0` are inherited from upstream [`@tintinweb/pi-tasks`](https://github.com/tintinweb/pi-tasks) and the linked release tags live in that repo.
+>
+> The fork diverged from upstream at the tip of `0.5.0` (commit `530d2db`). Everything in the `[0.6.0]` section below is fork-only work — nothing here has been merged into upstream.
+
+## [0.6.0] - 2026-05-15
+
+First release of the `@lhl/pi-tasks` fork. Two big themes:
+
+1. **Replaced the subagent execution model with prompt injection.** Earlier (in the fork's prior unreleased work) `TaskExecute` was rewritten to queue follow-up user prompts in the current pi session instead of spawning subagents via `@tintinweb/pi-subagents`. The whole RPC layer and the 996-line subagent integration test suite were removed.
+2. **Added a robust, interactive auto-advance mode.** A new tri-state `autoMode` setting walks the task list to completion, prompting the user about anything still in progress instead of silently retrying.
 
 ### Added
-- **TaskCreateMany** — batch-create multiple tasks in one tool call.
-- **Prompt-injected task execution** — `TaskExecute` now queues follow-up user prompts in the current session instead of spawning subagents.
-- **Auto-continue with prompts** — optional setting queues the next open unblocked task after completion or agent idle, with a per-task attempt cap.
-- **Persisted task execution stats** — task start time, duration, and token usage are stored in task metadata and rendered in `TaskGet`/the widget.
+- **Interactive auto mode** — new `autoMode: "auto"` setting (and `/tasks auto` command) drives the task list forward until everything is complete or cleared. The advance loop is blocker-aware; whenever a task is still `in_progress` at agent idle, the extension asks the user via `ui.select` whether to mark it complete, continue (re-queue), or stop auto mode. Auto-disables itself once every task is completed.
+- **Tri-state `autoMode` setting** — `off` (default), `cascade` (silent auto-advance, capped per task), `auto` (interactive). Configurable via `/tasks` → Settings, `/tasks auto [on|off|cascade|status]`, or `.pi/tasks-config.json`. The legacy boolean `autoCascade: true` is read transparently and mapped to `autoMode: "cascade"`.
+- **`/tasks auto` slash subcommand** — toggle auto-advance without opening the menu, with tab-completion for `on`/`off`/`cascade`/`status`. A matching “Start / Stop auto mode” entry was added to the interactive `/tasks` menu.
+- **Prompt-injected task execution** — `TaskExecute` queues follow-up user prompts (`pi.sendUserMessage(..., { deliverAs: "followUp" })`) in the current session instead of spawning subagents. Validates open/unblocked status, marks pending tasks `in_progress`, and emits a task-focused prompt. Completed prerequisites' `metadata.result` values are injected into dependent task prompts.
+- **Auto-continue with prompts** — optional behavior (now the `cascade` half of `autoMode`) that queues the next open unblocked task after task completion or agent idle, with a per-task attempt cap to prevent runaway loops.
+- **`TaskCreateMany`** — batch-create multiple tasks in one tool call. Returns a numbered summary of created tasks.
+- **Persisted task execution stats** — task start time, end time, duration, and input/output token usage are stored in `metadata.executionStats` and rendered in both `TaskGet` and the live widget (e.g. `started 3:14:07 · ended 3:15:56 · 1m 49s · ↑ 4.1k ↓ 1.2k`).
+- **Widget timing baselines** — in-progress task timers and token counters are restored from disk on session start/resume so resumed work shows correct elapsed time instead of resetting to zero.
 
 ### Changed
-- **Removed system-reminder injection** — task tools no longer append periodic `<system-reminder>` text to unrelated tool results.
-- **Widget overflow prioritizes active work** — when the task list overflows, in-progress and pending tasks stay visible before completed tasks.
-- **Updated pi dependencies** — imports and peer/dev dependencies now use `@earendil-works/*` and `@sinclair/typebox`.
+- **Forked and renamed** — package published as `@lhl/pi-tasks`. Repository, homepage, bug tracker, and media URLs now point at [`lhl/pi-tasks`](https://github.com/lhl/pi-tasks). Full credit for the original extension goes to [tintinweb](https://github.com/tintinweb).
+- **Settings UI** — the upstream “Auto-continue with prompts” on/off toggle was replaced by a single tri-state “Auto-advance mode” setting (`off` / `cascade` / `auto`).
+- **Migrated pi runtime to `@earendil-works/*`** — dependencies and source imports now use `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` (replacing upstream's `@mariozechner/*`) and the published `@sinclair/typebox ^0.34.49` (replacing upstream's `typebox ^1.1.34`). Pi runtime packages were also moved to `peerDependencies` so consumers control the version.
+- **Widget overflow prioritizes active work** — when more than `MAX_VISIBLE_TASKS` tasks exist, the widget shows in-progress + pending first and pushes completed entries off the bottom.
+- **`TaskGet`** — returns full `description`, filtered open blockers, structured execution-stats line, and any non-stats metadata; consistent with `TaskList` filtering.
+- **`TaskUpdate`** — distinguishes “task not found” via an explicit `notFound` return path; the tool surfaces this as a clear `Task #N not found` message instead of a silent no-op.
+
+### Removed
+- **`@tintinweb/pi-subagents` integration** — the entire RPC envelope (`rpcCall`, `subagents:rpc:*` channels), the `agentTaskMap`, spawn/stop/cascade subagent paths, and the 996-line `test/subagent-integration.test.ts` suite were deleted. `TaskExecute` no longer spawns subagents.
+- **System-reminder injection** — the periodic `<system-reminder>` text that upstream appended to unrelated tool results was removed. Task tools no longer pollute other tools' output.
+- **`agentType` requirement** — still accepted on `TaskCreate`/`TaskCreateMany` for backward compatibility (parked in metadata) but no longer required or referenced by `TaskExecute`.
 
 ### Fixed
-- **Task store durability** — missing task directories are recreated before save, corrupt file reads preserve in-memory state and report via `onCorruptFile`, and `TaskStore.update()` distinguishes missing IDs with `notFound`.
-- **Auto-clear reporting** — auto-clear now returns the IDs it removed.
+- **Task store durability** — missing task directories are recreated before save, corrupt file reads preserve in-memory state and report via a new `onCorruptFile` callback (surfaced as a non-fatal warning notification), and `TaskStore.update()` cleanly reports missing IDs.
+- **Auto-clear reporting** — `AutoClearManager.onTurnStart()` returns the list of IDs that were removed so callers can refresh the widget deterministically.
 
 ## [0.5.0] - 2026-04-28
 
@@ -167,6 +188,7 @@ Initial release — Claude Code-style task tracking and coordination for pi.
 - **Background process tracker** — output buffering (stdout + stderr), waiter notification, graceful stop with timeout escalation (SIGTERM → 5s → SIGKILL).
 - **78 unit tests** — task store CRUD, dependencies, warnings, file persistence; widget rendering, icons, spinners, token/duration formatting; process tracker lifecycle.
 
+[0.6.0]: https://github.com/lhl/pi-tasks/releases/tag/v0.6.0
 [0.4.2]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.2
 [0.4.1]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.1
 [0.4.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.0

@@ -9,7 +9,7 @@ import initExtension from "../src/index.js";
 beforeEach(() => { process.env.PI_TASKS = "off"; });
 afterEach(() => { delete process.env.PI_TASKS; });
 
-function mockCtx() {
+function mockCtx(overrides: { select?: (...args: any[]) => any } = {}) {
   return {
     sessionManager: { getSessionId: () => "test-session" },
     model: { id: "test-model", name: "Test" },
@@ -18,6 +18,9 @@ function mockCtx() {
       setWidget: vi.fn(),
       setStatus: vi.fn(),
       notify: vi.fn(),
+      select: vi.fn(overrides.select ?? (async () => undefined)),
+      input: vi.fn(async () => undefined),
+      confirm: vi.fn(async () => false),
     },
   };
 }
@@ -282,5 +285,241 @@ describe("Auto-continue with prompts", () => {
     }
 
     expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it("legacy autoCascade:true config still enables cascade mode", async () => {
+    await writeConfig({ autoCascade: true });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "A", description: "Do it" });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+  });
+
+  it("autoMode:cascade behaves like the legacy cascade setting", async () => {
+    await writeConfig({ autoMode: "cascade" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "A", description: "Do it" });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Auto mode (interactive)", () => {
+  afterEach(async () => {
+    await removeConfig();
+  });
+
+  async function readConfig(): Promise<Record<string, unknown>> {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const configPath = path.join(process.cwd(), ".pi", "tasks-config.json");
+    try { return JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch { return {}; }
+  }
+
+  it("asks the user about an in_progress task at agent_end", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    // Task #1 pending, #2 also pending
+    await mock.executeTool("TaskCreate", { subject: "First", description: "Desc" });
+    await mock.executeTool("TaskCreate", { subject: "Second", description: "Desc" });
+    // Mark #1 in_progress to simulate the agent having started it but not completed it
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+
+    const selectMock = vi.fn(async (_title: string, choices: string[]) => choices[0]); // pick "Mark complete"
+    const ctx = mockCtx({ select: selectMock });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    // ui.select was invoked with a title mentioning task #1
+    expect(selectMock).toHaveBeenCalled();
+    expect(selectMock.mock.calls[0][0]).toContain("#1");
+
+    // After "Mark complete", task #1 should now be completed and #2 should be queued
+    const detail1 = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(detail1.content[0].text).toContain("Status: completed");
+
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+  });
+
+  it("re-queues the same task when the user picks Continue", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Only task", description: "Keep going" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+
+    // Pick "Continue" (the second option)
+    const selectMock = vi.fn(async (_t: string, choices: string[]) => choices[1]);
+    const ctx = mockCtx({ select: selectMock });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    // Should have re-queued task #1
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+
+    // Task is still in_progress
+    const detail = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(detail.content[0].text).toContain("Status: in_progress");
+  });
+
+  it("disables auto mode when the user picks Stop", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Open", description: "Desc" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+
+    // Pick "Stop auto mode" (third option)
+    const selectMock = vi.fn(async (_t: string, choices: string[]) => choices[2]);
+    const ctx = mockCtx({ select: selectMock });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Auto mode stopped.", "info");
+    expect((await readConfig()).autoMode).toBe("off");
+  });
+
+  it("auto-disables and notifies once every task is completed", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Done", description: "Desc" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+
+    const ctx = mockCtx();
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Auto mode finished"),
+      "info",
+    );
+    expect((await readConfig()).autoMode).toBe("off");
+  });
+
+  it("queues the next pending task when no in_progress task is present", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Pending", description: "Do it" });
+
+    const selectMock = vi.fn(async () => undefined);
+    const ctx = mockCtx({ select: selectMock });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+  });
+
+  it("skips blocked in_progress tasks", async () => {
+    await writeConfig({ autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    // Two tasks: #1 blocks #2; mark #2 in_progress (unusual but possible after manual moves)
+    await mock.executeTool("TaskCreate", { subject: "Blocker", description: "" });
+    await mock.executeTool("TaskCreate", { subject: "Blocked", description: "" });
+    await mock.executeTool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
+    await mock.executeTool("TaskUpdate", { taskId: "2", status: "in_progress" });
+
+    const selectMock = vi.fn(async () => undefined);
+    const ctx = mockCtx({ select: selectMock });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+
+    // Should NOT ask about blocked task #2; should queue #1 (the only unblocked task)
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+  });
+});
+
+describe("/tasks auto command", () => {
+  afterEach(async () => {
+    await removeConfig();
+  });
+
+  async function readConfig(): Promise<Record<string, unknown>> {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const configPath = path.join(process.cwd(), ".pi", "tasks-config.json");
+    try { return JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch { return {}; }
+  }
+
+  it("/tasks auto sets autoMode and queues the next open task", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Work", description: "Do it" });
+
+    const ctx = mockCtx();
+    const handler = mock.commands.get("tasks")!.handler;
+    await handler("auto", ctx);
+
+    expect((await readConfig()).autoMode).toBe("auto");
+    // Task is pending, no in_progress task, so a follow-up should be queued immediately.
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+  });
+
+  it("/tasks auto off disables auto mode and clears the legacy flag", async () => {
+    await writeConfig({ autoCascade: true, autoMode: "auto" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    const ctx = mockCtx();
+    const handler = mock.commands.get("tasks")!.handler;
+    await handler("auto off", ctx);
+
+    const config = await readConfig();
+    expect(config.autoMode).toBe("off");
+    expect(config.autoCascade).toBeUndefined();
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("/tasks auto cascade switches to cascade mode", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Work", description: "Do it" });
+
+    const ctx = mockCtx();
+    const handler = mock.commands.get("tasks")!.handler;
+    await handler("auto cascade", ctx);
+
+    expect((await readConfig()).autoMode).toBe("cascade");
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+  });
+
+  it("/tasks auto status reports the current mode without changing it", async () => {
+    await writeConfig({ autoMode: "cascade" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    const ctx = mockCtx();
+    const handler = mock.commands.get("tasks")!.handler;
+    await handler("auto status", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("cascade"),
+      "info",
+    );
+    expect((await readConfig()).autoMode).toBe("cascade");
   });
 });

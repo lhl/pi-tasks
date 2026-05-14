@@ -1,16 +1,19 @@
 {
-  "name": "@tintinweb/pi-tasks",
-  "version": "0.5.0",
-  "description": "A pi extension that brings Claude Code-style task tracking and coordination to pi.",
-  "author": "tintinweb",
+  "name": "@lhl/pi-tasks",
+  "version": "0.6.0",
+  "description": "A pi extension for structured task tracking, blocker-aware auto-advance, and coordination. Fork of @tintinweb/pi-tasks.",
+  "author": "lhl",
+  "contributors": [
+    "tintinweb (original author of @tintinweb/pi-tasks)"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-tasks.git"
+    "url": "https://github.com/lhl/pi-tasks.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-tasks#readme",
+  "homepage": "https://github.com/lhl/pi-tasks#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-tasks/issues"
+    "url": "https://github.com/lhl/pi-tasks/issues"
   },
   "keywords": [
     "pi-package",
@@ -48,7 +51,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "video": "https://github.com/tintinweb/pi-tasks/raw/master/media/demo.mp4",
-    "image": "https://github.com/tintinweb/pi-tasks/raw/master/media/screenshot.png"
+    "video": "https://github.com/lhl/pi-tasks/raw/master/media/demo.mp4",
+    "image": "https://github.com/lhl/pi-tasks/raw/master/media/screenshot.png"
   }
 }
