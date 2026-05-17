@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 >
 > The fork diverged from upstream at the tip of `0.5.0` (commit `530d2db`). Everything in the `[0.6.0]` section below is fork-only work — nothing here has been merged into upstream.
 
+## [Unreleased]
+
+### Fixed
+- Auto-advance now intercepts stale task follow-up prompts before they reach the model. If a queued prompt targets a task that was completed, deleted, or became blocked while waiting in pi's follow-up queue, the extension marks that prompt handled, clears its queued/attempt bookkeeping, and advances to the next valid task when auto mode is enabled.
+
 ## [0.6.0] - 2026-05-15
 
 First release of the `@lhl/pi-tasks` fork. Two big themes:

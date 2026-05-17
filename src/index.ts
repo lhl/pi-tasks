@@ -134,6 +134,12 @@ export default function (pi: ExtensionAPI) {
       ?? tasks.find(t => t.status === "pending" && getOpenBlockers(t).length === 0);
   }
 
+  /** Return the task ID from a prompt produced by buildTaskPrompt(). */
+  function parseTaskPromptId(text: unknown): string | undefined {
+    if (typeof text !== "string") return undefined;
+    return text.match(/^Continue by working on task #(\d+):/)?.[1];
+  }
+
   /** Build a follow-up user prompt for work on a task.
    *  Injects completed dependency results when available so dependent tasks can build on prerequisites.
    */
@@ -393,6 +399,47 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // Intercept extension-generated task prompts before they reach the model.
+  // A follow-up prompt can sit in pi's queue while a user or another turn marks
+  // the task complete/deleted/blocked. Treat those prompts as stale instead of
+  // spending another model turn on already-finished work.
+  pi.on("input", async (event, ctx) => {
+    latestCtx = ctx;
+    widget.setUICtx(ctx.ui as UICtx);
+    upgradeStoreIfNeeded(ctx);
+
+    const deliveredTaskId = parseTaskPromptId(event.text);
+    if (!deliveredTaskId) {
+      showPersistedTasks();
+      return { action: "continue" as const };
+    }
+
+    queuedTaskIds.delete(deliveredTaskId);
+    const task = store.get(deliveredTaskId);
+    let staleReason: string | undefined;
+    if (!task) {
+      staleReason = `task #${deliveredTaskId} no longer exists`;
+    } else if (task.status === "completed") {
+      staleReason = `task #${deliveredTaskId} is already completed`;
+    } else {
+      const openBlockers = getOpenBlockers(task);
+      if (openBlockers.length > 0) {
+        staleReason = `task #${deliveredTaskId} is blocked by ${openBlockers.map(id => "#" + id).join(", ")}`;
+      }
+    }
+
+    if (!staleReason) return { action: "continue" as const };
+
+    autoPromptAttempts.delete(deliveredTaskId);
+    widget.setActiveTask(deliveredTaskId, false);
+    widget.update();
+    ctx.ui.notify(`Skipping stale task prompt: ${staleReason}.`, "info");
+    if (getAutoMode(cfg) !== "off") {
+      await autoAdvance(ctx, "stale_task_prompt");
+    }
+    return { action: "handled" as const };
+  });
+
   // Grab UI context early — before_agent_start fires before any tool calls,
   // so persisted tasks show up immediately on session start.
   pi.on("before_agent_start", async (event, ctx) => {
@@ -403,8 +450,10 @@ export default function (pi: ExtensionAPI) {
 
     // A queued follow-up is no longer merely queued once pi starts processing it.
     // Clearing here lets auto-continue retry still-open work after the turn ends,
-    // subject to AUTO_CONTINUE_MAX_ATTEMPTS.
-    const deliveredTaskId = event.prompt.match(/^Continue by working on task #(\d+)/)?.[1];
+    // subject to AUTO_CONTINUE_MAX_ATTEMPTS. The input handler already performs
+    // this for normal delivery; keep this as a fallback for older pi versions or
+    // non-standard prompt injection paths that bypass input events.
+    const deliveredTaskId = parseTaskPromptId(event.prompt);
     if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
   });
 

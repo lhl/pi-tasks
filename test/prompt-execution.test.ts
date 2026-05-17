@@ -269,6 +269,78 @@ describe("Auto-continue with prompts", () => {
     expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
   });
 
+  it("handles stale queued prompts for already completed tasks before agent start", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Open task", description: "Do it" });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    const queuedPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+
+    const ctx = mockCtx();
+    const results = await mock.fireLifecycle(
+      "input",
+      { text: queuedPrompt, source: "extension" },
+      ctx,
+    );
+
+    expect(results).toEqual([{ action: "handled" }]);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("task #1 is already completed"),
+      "info",
+    );
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+  });
+
+  it("handles stale queued prompts for deleted tasks before agent start", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Obsolete task", description: "Do it" });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    const queuedPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "deleted" });
+
+    const ctx = mockCtx();
+    const results = await mock.fireLifecycle(
+      "input",
+      { text: queuedPrompt, source: "extension" },
+      ctx,
+    );
+
+    expect(results).toEqual([{ action: "handled" }]);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("task #1 no longer exists"),
+      "info",
+    );
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not re-queue stale completed prompts when cascade already advanced", async () => {
+    await writeConfig({ autoMode: "cascade" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "First", description: "Do it" });
+    await mock.executeTool("TaskCreate", { subject: "Second", description: "Do next" });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    const stalePrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(mock.pi.sendUserMessage.mock.calls[1][0]).toContain("Continue by working on task #2");
+
+    const results = await mock.fireLifecycle(
+      "input",
+      { text: stalePrompt, source: "extension" },
+      mockCtx(),
+    );
+
+    expect(results).toEqual([{ action: "handled" }]);
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("can retry a delivered prompt for still-open work, capped per task", async () => {
     await writeConfig({ autoCascade: true });
     const mock = mockPi();
