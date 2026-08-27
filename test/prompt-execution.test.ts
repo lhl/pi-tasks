@@ -594,4 +594,20 @@ describe("/tasks auto command", () => {
     );
     expect((await readConfig()).autoMode).toBe("cascade");
   });
+
+  it("disposes the active task widget timer on session shutdown", async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+      await mock.executeTool("TaskCreate", { subject: "Work", description: "Do it" });
+      await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+      expect(vi.getTimerCount()).toBe(1);
+
+      await mock.fireLifecycle("session_shutdown", { reason: "quit" }, mockCtx());
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -399,6 +399,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("session_shutdown" as any, async () => {
+    widget.dispose();
+    latestCtx = undefined;
+  });
+
   // Intercept extension-generated task prompts before they reach the model.
   // A follow-up prompt can sit in pi's queue while a user or another turn marks
   // the task complete/deleted/blocked. Treat those prompts as stale instead of
