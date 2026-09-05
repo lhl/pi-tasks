@@ -184,7 +184,7 @@ describe("TaskWidget", () => {
     expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
   });
 
-  it("limits visible tasks to MAX_VISIBLE_TASKS", () => {
+  it("limits visible tasks to the default maximum", () => {
     for (let i = 0; i < 15; i++) {
       store.create(`Task ${i + 1}`, "Desc");
     }
@@ -194,6 +194,35 @@ describe("TaskWidget", () => {
     // header + 10 tasks + "… and 5 more"
     expect(lines).toHaveLength(12);
     expect(lines[11]).toContain("5 more");
+  });
+
+  it("honors the configured visible-task limit", () => {
+    widget = new TaskWidget(store, { maxVisible: 5 });
+    widget.setUICtx(ui.ctx);
+    for (let i = 0; i < 8; i++) store.create(`Task ${i + 1}`, "Desc");
+    widget.update();
+
+    const lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(7);
+    expect(lines[6]).toContain("3 more");
+  });
+
+  it("collapses completed tasks to one summary row", () => {
+    widget = new TaskWidget(store, { collapseCompleted: true });
+    widget.setUICtx(ui.ctx);
+    store.create("Done one", "Desc");
+    store.create("Done two", "Desc");
+    store.create("Open", "Desc");
+    store.update("1", { status: "completed" });
+    store.update("2", { status: "completed" });
+    widget.update();
+
+    const lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toContain("Open");
+    expect(lines[2]).toContain("2 completed");
+    expect(lines.join("\n")).not.toContain("Done one");
+    expect(lines.join("\n")).not.toContain("Done two");
   });
 
   it("tracks token usage for active tasks", () => {
@@ -288,10 +317,11 @@ describe("TaskWidget", () => {
     expect(lines[1]).toContain("My Subject…");
   });
 
-  it("shows elapsed time but no token arrows when tokens are zero", () => {
+  it("shows agent-active time but no token arrows when tokens are zero", () => {
     store.create("No tokens", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     // No addTokenUsage calls — tokens stay at 0
     vi.advanceTimersByTime(5000);
@@ -361,6 +391,7 @@ describe("TaskWidget", () => {
     store.create("Finished task", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     widget.addTokenUsage(1500, 800);
     vi.advanceTimersByTime(65_000);
@@ -380,6 +411,41 @@ describe("TaskWidget", () => {
     expect(lines[1]).toContain("1m 5s");
     expect(lines[1]).toContain("↑ 1.5k");
     expect(lines[1]).toContain("↓ 800");
+  });
+
+  it("does not infer active duration for an untracked completed task", () => {
+    vi.setSystemTime(new Date("2026-04-13T15:04:00Z"));
+    store.create("Untracked task", "Desc");
+    vi.advanceTimersByTime(60_000);
+    store.update("1", { status: "completed" });
+    widget.update();
+
+    expect(store.get("1")?.metadata.executionStats).toMatchObject({
+      durationMs: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+  });
+
+  it("excludes user idle time from persisted duration", () => {
+    vi.setSystemTime(new Date("2026-04-13T15:04:00Z"));
+    store.create("Measured task", "Desc", "Working");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+
+    vi.advanceTimersByTime(60_000);
+    widget.onAgentStart();
+    vi.advanceTimersByTime(5_000);
+    widget.onAgentEnd();
+    vi.advanceTimersByTime(30_000);
+    widget.onAgentStart();
+    vi.advanceTimersByTime(7_000);
+    store.update("1", { status: "completed" });
+    widget.setActiveTask("1", false);
+
+    expect(store.get("1")?.metadata.executionStats).toMatchObject({
+      durationMs: 12_000,
+    });
   });
 });
 
@@ -405,6 +471,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Quick", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     vi.advanceTimersByTime(30_000); // 30s
     widget.update();
@@ -417,6 +484,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Long", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     vi.advanceTimersByTime(3_723_000); // 1h 2m 3s → "1h 2m"
     widget.update();
@@ -429,6 +497,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Exact", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     vi.advanceTimersByTime(7_200_000); // 2h exactly
     widget.update();
@@ -441,6 +510,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Medium", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.onAgentStart();
 
     vi.advanceTimersByTime(169_000); // 2m 49s
     widget.update();

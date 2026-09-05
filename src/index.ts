@@ -110,7 +110,7 @@ export default function (pi: ExtensionAPI) {
   let storeTarget = resolveStoreTarget();
   let store = new TaskStore(storeTarget.path);
   const tracker = new ProcessTracker();
-  const widget = new TaskWidget(store);
+  const widget = new TaskWidget(store, cfg);
 
   const registerMarkdownTransformer = (pi as any).registerMarkdownTransformer;
   if (typeof registerMarkdownTransformer === "function") {
@@ -552,6 +552,10 @@ export default function (pi: ExtensionAPI) {
     if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
   });
 
+  pi.on("agent_start", async () => {
+    widget.onAgentStart();
+  });
+
   // Keep widget context fresh on every tool execution as well.
   pi.on("tool_execution_start", async (_event, ctx) => {
     latestCtx = ctx;
@@ -561,6 +565,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    widget.onAgentEnd();
     if (ctx) {
       latestCtx = ctx;
       widget.setUICtx(ctx.ui as UICtx);

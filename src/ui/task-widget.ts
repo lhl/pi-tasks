@@ -10,6 +10,7 @@
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { TaskStore } from "../task-store.js";
+import type { TasksConfig } from "../tasks-config.js";
 import { isCompletedTaskExecutionStats, isTaskExecutionStats, type Task, type TaskExecutionStats } from "../types.js";
 
 // ---- Types ----
@@ -32,11 +33,13 @@ export type UICtx = {
 /** Star spinner frames for animated active task indicator (matches Claude Code). */
 const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽"];
 
-const MAX_VISIBLE_TASKS = 10;
+const DEFAULT_MAX_VISIBLE_TASKS = 10;
 
-/** Per-task runtime metrics (elapsed time, token usage). */
+/** Per-task runtime metrics. Duration advances only while the agent is running. */
 export interface TaskMetrics {
   startedAt: number;
+  activeDurationMs: number;
+  activeSince?: number;
   inputTokens: number;
   outputTokens: number;
 }
@@ -68,10 +71,14 @@ function formatClockTime(ms: number): string {
   }).format(ms);
 }
 
+function getActiveDuration(metrics: TaskMetrics, now = Date.now()): number {
+  return metrics.activeDurationMs + (metrics.activeSince === undefined ? 0 : Math.max(0, now - metrics.activeSince));
+}
+
 function formatLiveStats(theme: Theme, metrics: TaskMetrics | undefined): string {
   if (!metrics) return "";
 
-  const elapsed = formatDuration(Date.now() - metrics.startedAt);
+  const elapsed = formatDuration(getActiveDuration(metrics));
   const tokenParts: string[] = [];
   if (metrics.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(metrics.inputTokens)}`);
   if (metrics.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(metrics.outputTokens)}`);
@@ -88,6 +95,8 @@ export class TaskWidget {
   private widgetInterval: ReturnType<typeof setInterval> | undefined;
   /** IDs of tasks currently being actively executed (show spinner). */
   private activeTaskIds = new Set<string>();
+  /** Whether an agent run is contributing time to active tasks. */
+  private agentRunActive = false;
   /** Per-task runtime metrics keyed by task ID. */
   private metrics = new Map<string, TaskMetrics>();
   /** Cached TUI instance for requestRender() calls. */
@@ -95,10 +104,16 @@ export class TaskWidget {
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
 
-  constructor(private store: TaskStore) {}
+  constructor(
+    private store: TaskStore,
+    private config: TasksConfig = {},
+  ) {}
 
   setStore(store: TaskStore) {
     this.store = store;
+    this.activeTaskIds.clear();
+    this.metrics.clear();
+    this.agentRunActive = false;
   }
 
   setUICtx(ctx: UICtx) {
@@ -112,6 +127,7 @@ export class TaskWidget {
         executionStats: {
           ...existingStats,
           startedAt,
+          durationMs: existingStats?.durationMs ?? 0,
           inputTokens: existingStats?.inputTokens ?? 0,
           outputTokens: existingStats?.outputTokens ?? 0,
         },
@@ -130,29 +146,19 @@ export class TaskWidget {
       return {
         startedAt,
         completedAt,
-        durationMs: Math.max(0, completedAt - startedAt),
+        durationMs: getActiveDuration(metrics),
         inputTokens: metrics.inputTokens,
         outputTokens: metrics.outputTokens,
       };
     }
     if (isCompletedTaskExecutionStats(existingStats)) return existingStats;
 
-    const blockerCompletedAt = task.blockedBy
-      .map((id) => this.store.get(id))
-      .flatMap((blocker) => {
-        if (!blocker || blocker.status !== "completed") return [];
-        const blockerStats = isTaskExecutionStats(blocker.metadata?.executionStats)
-          ? blocker.metadata.executionStats
-          : undefined;
-        return [blockerStats?.completedAt ?? blocker.updatedAt];
-      });
-    const startedAt = Math.max(task.createdAt, ...blockerCompletedAt);
     return {
-      startedAt,
+      startedAt: existingStats?.startedAt ?? task.updatedAt,
       completedAt: task.updatedAt,
-      durationMs: Math.max(0, task.updatedAt - startedAt),
-      inputTokens: 0,
-      outputTokens: 0,
+      durationMs: existingStats?.durationMs ?? 0,
+      inputTokens: existingStats?.inputTokens ?? 0,
+      outputTokens: existingStats?.outputTokens ?? 0,
     };
   }
 
@@ -180,6 +186,8 @@ export class TaskWidget {
         const startedAt = existingStats?.startedAt ?? task.updatedAt;
         this.metrics.set(task.id, {
           startedAt,
+          activeDurationMs: existingStats?.durationMs ?? 0,
+          activeSince: this.agentRunActive && this.activeTaskIds.has(task.id) ? Date.now() : undefined,
           inputTokens: existingStats?.inputTokens ?? 0,
           outputTokens: existingStats?.outputTokens ?? 0,
         });
@@ -219,6 +227,8 @@ export class TaskWidget {
         const startedAt = existingStats?.startedAt ?? Date.now();
         this.metrics.set(taskId, {
           startedAt,
+          activeDurationMs: existingStats?.durationMs ?? 0,
+          activeSince: this.agentRunActive ? Date.now() : undefined,
           inputTokens: existingStats?.inputTokens ?? 0,
           outputTokens: existingStats?.outputTokens ?? 0,
         });
@@ -227,8 +237,49 @@ export class TaskWidget {
       this.ensureTimer();
     } else if (taskId) {
       this.activeTaskIds.delete(taskId);
+      const metrics = this.metrics.get(taskId);
+      if (metrics?.activeSince !== undefined) {
+        metrics.activeDurationMs = getActiveDuration(metrics);
+        metrics.activeSince = undefined;
+      }
       const task = this.store.get(taskId);
       this.persistMetrics(taskId, task);
+    }
+    this.update();
+  }
+
+  /** Start timing active tasks for one Pi agent run. */
+  onAgentStart(now = Date.now()) {
+    if (this.agentRunActive) return;
+    this.agentRunActive = true;
+    for (const id of this.activeTaskIds) {
+      const metrics = this.metrics.get(id);
+      if (metrics && metrics.activeSince === undefined) metrics.activeSince = now;
+    }
+  }
+
+  /** Stop timing and persist partial metrics when one Pi agent run ends. */
+  onAgentEnd(now = Date.now()) {
+    if (!this.agentRunActive) return;
+    this.agentRunActive = false;
+    for (const id of this.activeTaskIds) {
+      const metrics = this.metrics.get(id);
+      const task = this.store.get(id);
+      if (!metrics || !task || task.status !== "in_progress") continue;
+      if (metrics.activeSince !== undefined) {
+        metrics.activeDurationMs = getActiveDuration(metrics, now);
+        metrics.activeSince = undefined;
+      }
+      this.store.update(id, {
+        metadata: {
+          executionStats: {
+            startedAt: metrics.startedAt,
+            durationMs: metrics.activeDurationMs,
+            inputTokens: metrics.inputTokens,
+            outputTokens: metrics.outputTokens,
+          },
+        },
+      });
     }
     this.update();
   }
@@ -285,10 +336,20 @@ export class TaskWidget {
     const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
     const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
 
-    const visibleSource = tasks.length > MAX_VISIBLE_TASKS
-      ? [...inProgress, ...pending, ...completed]
-      : tasks;
-    const visible = visibleSource.slice(0, MAX_VISIBLE_TASKS);
+    const configuredLimit = this.config.maxVisible;
+    const limit = typeof configuredLimit === "number" && Number.isInteger(configuredLimit) && configuredLimit > 0
+      ? configuredLimit
+      : DEFAULT_MAX_VISIBLE_TASKS;
+    const collapseCompleted = this.config.collapseCompleted ?? false;
+    const listed = collapseCompleted ? tasks.filter(task => task.status !== "completed") : tasks;
+    const visibleSource = listed.length > limit
+      ? [
+        ...listed.filter(task => task.status === "in_progress"),
+        ...listed.filter(task => task.status === "pending"),
+        ...listed.filter(task => task.status === "completed"),
+      ]
+      : listed;
+    const visible = visibleSource.slice(0, limit);
     for (const task of visible) {
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
 
@@ -344,8 +405,11 @@ export class TaskWidget {
       lines.push(truncate(text + suffix));
     }
 
-    if (visibleSource.length > MAX_VISIBLE_TASKS) {
-      lines.push(truncate(theme.fg("dim", `    … and ${visibleSource.length - MAX_VISIBLE_TASKS} more`)));
+    if (visibleSource.length > limit) {
+      lines.push(truncate(theme.fg("dim", `    … and ${visibleSource.length - limit} more`)));
+    }
+    if (collapseCompleted && completed.length > 0) {
+      lines.push(truncate(`  ${theme.fg("success", "✔")} ${theme.fg("dim", `${completed.length} completed`)}`));
     }
 
     return lines;
@@ -403,6 +467,7 @@ export class TaskWidget {
   }
 
   dispose() {
+    this.onAgentEnd();
     if (this.widgetInterval) {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;

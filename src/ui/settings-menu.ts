@@ -54,6 +54,23 @@ export async function openSettingsMenu(
         values: ["off", "cascade", "auto"],
       },
       {
+        id: "collapseCompleted",
+        label: "Collapse completed tasks",
+        description:
+          "on: completed tasks appear as one summary line. " +
+          "off: completed tasks remain listed individually.",
+        currentValue: (cfg.collapseCompleted ?? false) ? "on" : "off",
+        values: ["on", "off"],
+      },
+      {
+        id: "maxVisible",
+        label: "Max visible tasks in widget",
+        description:
+          "Caps task rows in the widget. The completed summary and overflow indicator are separate rows.",
+        currentValue: String(cfg.maxVisible ?? 10),
+        values: ["5", "10", "15", "20", "30", "50", "100"],
+      },
+      {
         id: "autoClearCompleted",
         label: "Auto-clear completed tasks",
         description:
@@ -83,6 +100,14 @@ export async function openSettingsMenu(
         }
         if (id === "autoClearCompleted") {
           cfg.autoClearCompleted = newValue as TasksConfig["autoClearCompleted"];
+          saveTasksConfig(cfg, cwd);
+        }
+        if (id === "collapseCompleted") {
+          cfg.collapseCompleted = newValue === "on";
+          saveTasksConfig(cfg, cwd);
+        }
+        if (id === "maxVisible") {
+          cfg.maxVisible = Number(newValue);
           saveTasksConfig(cfg, cwd);
         }
       },
