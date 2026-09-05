@@ -26,6 +26,7 @@ export async function openSettingsMenu(
   cfg: TasksConfig,
   onBack: () => Promise<void>,
   clearDelayTurns: number,
+  cwd: string,
 ): Promise<void> {
   await ui.custom((_tui, theme, _kb, done) => {
     const items: SettingItem[] = [
@@ -34,11 +35,12 @@ export async function openSettingsMenu(
         label: "Task storage",
         description:
           "memory: tasks live only in memory, lost when session ends. " +
-          "session: persisted per session (tasks-<sessionId>.json), survives resume. " +
-          "project: shared across all sessions (tasks.json). " +
+          "session: persisted per session in the workspace, survives resume. " +
+          "session-global: per-session storage under Pi's agent directory. " +
+          "project: shared across all sessions in the workspace. " +
           "Takes effect on next session start.",
         currentValue: cfg.taskScope ?? "session",
-        values: ["memory", "session", "project"],
+        values: ["memory", "session", "session-global", "project"],
       },
       {
         id: "autoMode",
@@ -73,15 +75,15 @@ export async function openSettingsMenu(
           cfg.autoMode = newValue as AutoMode;
           // Clear the legacy boolean field so it stops shadowing the new setting.
           if ("autoCascade" in cfg) delete cfg.autoCascade;
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "taskScope") {
-          cfg.taskScope = newValue as "memory" | "session" | "project";
-          saveTasksConfig(cfg);
+          cfg.taskScope = newValue as TasksConfig["taskScope"];
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "autoClearCompleted") {
           cfg.autoClearCompleted = newValue as TasksConfig["autoClearCompleted"];
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
       },
       /* onCancel */ () => done(undefined),

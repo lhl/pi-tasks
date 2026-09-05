@@ -16,13 +16,20 @@
  *   /tasks       — Interactive task management menu
  */
 
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { TaskStore } from "./task-store.js";
-import { type AutoMode, getAutoMode, loadTasksConfig, saveTasksConfig } from "./tasks-config.js";
+import {
+  type AutoMode,
+  getAutoMode,
+  loadGlobalTasksConfig,
+  loadTasksConfig,
+  saveTasksConfig,
+} from "./tasks-config.js";
 import { isCompletedTaskExecutionStats, isTaskExecutionStats, type Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
@@ -71,29 +78,37 @@ const AUTO_CLEAR_DELAY = 4;
 const AUTO_CONTINUE_MAX_ATTEMPTS = 3;
 
 export default function (pi: ExtensionAPI) {
-  // Initialize store and config
-  const cfg = loadTasksConfig();
+  // Project overrides require ExtensionContext.cwd, which is unavailable while
+  // the extension factory runs. Start with global defaults and load project
+  // overrides on the first context-bearing event.
+  const cfg = loadGlobalTasksConfig();
   const piTasks = process.env.PI_TASKS;
-  const taskScope = cfg.taskScope ?? "session";
+  let taskScope = cfg.taskScope ?? "session";
+  const isSessionScope = () => taskScope === "session" || taskScope === "session-global";
 
-  /** Resolve the task store path from env/config (without session ID). */
-  function resolveStorePath(sessionId?: string): string | undefined {
-    if (piTasks === "off") return undefined;
-    if (piTasks?.startsWith("/")) return piTasks;
-    if (piTasks?.startsWith(".")) return resolve(piTasks);
-    if (piTasks) return piTasks;
-    if (taskScope === "memory") return undefined;
-    if (taskScope === "session" && sessionId) {
-      return join(process.cwd(), ".pi", "tasks", `tasks-${sessionId}.json`);
+  /** Resolve both the backing path and a stable identity for the active store. */
+  function resolveStoreTarget(cwd?: string, sessionId?: string): { key: string; path?: string } {
+    if (piTasks === "off") return { key: "memory:env" };
+    if (piTasks && isAbsolute(piTasks)) return { key: `path:${piTasks}`, path: piTasks };
+    if (piTasks?.startsWith(".")) {
+      const path = cwd ? resolve(cwd, piTasks) : undefined;
+      return path ? { key: `path:${path}`, path } : { key: "pending:relative" };
     }
-    if (taskScope === "session") return undefined; // no session ID yet, start in-memory
-    return join(process.cwd(), ".pi", "tasks", "tasks.json");
+    if (piTasks) return { key: `named:${piTasks}`, path: piTasks };
+    if (taskScope === "memory") return { key: "memory:config" };
+    if (!cwd) return { key: "pending:workspace" };
+    if (isSessionScope() && sessionId) {
+      const path = sessionTaskFile(cwd, sessionId, taskScope);
+      return { key: `path:${path}`, path };
+    }
+    if (isSessionScope()) return { key: "pending:session" };
+    const path = join(cwd, ".pi", "tasks", "tasks.json");
+    return { key: `path:${path}`, path };
   }
 
-  // For project scope (or env override), create store immediately.
-  // For session scope, start with in-memory and upgrade once we have the session ID.
   let latestCtx: ExtensionContext | undefined;
-  let store = new TaskStore(resolveStorePath());
+  let storeTarget = resolveStoreTarget();
+  let store = new TaskStore(storeTarget.path);
   const tracker = new ProcessTracker();
   const widget = new TaskWidget(store);
 
@@ -132,7 +147,7 @@ export default function (pi: ExtensionAPI) {
   function setAutoMode(mode: AutoMode): void {
     cfg.autoMode = mode;
     if ("autoCascade" in cfg) delete cfg.autoCascade;
-    saveTasksConfig(cfg);
+    if (latestCtx?.cwd) saveTasksConfig(cfg, latestCtx.cwd);
   }
 
   function getOpenBlockers(task: Pick<Task, "blockedBy">): string[] {
@@ -403,26 +418,38 @@ export default function (pi: ExtensionAPI) {
 
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
 
-  // ── Session-scoped store upgrade ──
-  // For session scope, the store starts in-memory (no session ID at init time).
-  // Upgrade to file-backed on first context arrival (turn_start, before_agent_start,
-  // or tool_execution_start — whichever fires first).
-  let storeUpgraded = false;
+  // ── Context-scoped store initialization ──
+  // Project paths cannot be resolved until an ExtensionContext is available.
+  // Reinitialize when the host moves this extension instance to another workspace.
+  let configuredCwd: string | undefined;
   let persistedTasksShown = false;
-  function upgradeStoreIfNeeded(ctx: ExtensionContext) {
-    if (storeUpgraded) return;
-    if (taskScope === "session" && !piTasks) {
-      const sessionManager = ctx.sessionManager as any;
-      const hasSessionFileApi = typeof sessionManager.getSessionFile === "function";
-      const sessionId = !hasSessionFileApi || sessionManager.getSessionFile()
-        ? ctx.sessionManager.getSessionId()
-        : undefined;
-      const path = resolveStorePath(sessionId);
-      store = new TaskStore(path);
+  function initializeStoreForContext(ctx: ExtensionContext, reloadConfig = false) {
+    if (reloadConfig || configuredCwd !== ctx.cwd) {
+      for (const key of Object.keys(cfg) as (keyof typeof cfg)[]) delete cfg[key];
+      Object.assign(cfg, loadTasksConfig(ctx.cwd));
+      taskScope = cfg.taskScope ?? "session";
+    }
+
+    const sessionManager = ctx.sessionManager as any;
+    const hasSessionFileApi = typeof sessionManager.getSessionFile === "function";
+    const sessionId = isSessionScope() && !piTasks && (!hasSessionFileApi || sessionManager.getSessionFile())
+      ? ctx.sessionManager.getSessionId()
+      : undefined;
+    const nextTarget = resolveStoreTarget(ctx.cwd, sessionId);
+    if (nextTarget.key !== storeTarget.key) {
+      store = new TaskStore(nextTarget.path);
       store.onCorruptFile = onCorruptFile;
       widget.setStore(store);
+      storeTarget = nextTarget;
     }
-    storeUpgraded = true;
+    configuredCwd = ctx.cwd;
+  }
+
+  function deleteSessionFileIfEmpty() {
+    if (!store.deleteFileIfEmpty()) return;
+    if (taskScope === "session-global" && !piTasks && configuredCwd) {
+      reclaimGlobalSessionTasksDir(configuredCwd);
+    }
   }
 
   /** Restore widget on session start/resume if there's unfinished work.
@@ -436,7 +463,7 @@ export default function (pi: ExtensionAPI) {
     if (tasks.length > 0) {
       if (!isResume && tasks.every(t => t.status === "completed")) {
         store.clearCompleted();
-        if (taskScope === "session") store.deleteFileIfEmpty();
+        if (isSessionScope()) deleteSessionFileIfEmpty();
       } else {
         widget.update();
       }
@@ -450,10 +477,10 @@ export default function (pi: ExtensionAPI) {
     currentTurn++;
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
     const autoClearResult = autoClear.onTurnStart(currentTurn);
     if (autoClearResult.cleared) {
-      if (taskScope === "session") store.deleteFileIfEmpty();
+      if (isSessionScope()) deleteSessionFileIfEmpty();
       widget.update();
     }
   });
@@ -488,7 +515,6 @@ export default function (pi: ExtensionAPI) {
     const isSwitch = reason === "new" || reason === "resume" || reason === "fork";
     const forkSeed = reason === "fork" ? store.snapshot() : undefined;
     if (isSwitch) {
-      storeUpgraded = false;
       persistedTasksShown = false;
       currentTurn = 0;
       queuedTaskIds.clear();
@@ -500,7 +526,7 @@ export default function (pi: ExtensionAPI) {
       if (reason === "new" && (taskScope === "memory" || piTasks === "off")) store.clearAll();
     }
 
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx, true);
     if (forkSeed?.tasks.length) store.seed(forkSeed);
     const keepsTasks = reason === "reload" || reason === "resume" || reason === "fork";
     showPersistedTasks(keepsTasks);
@@ -519,7 +545,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
     showPersistedTasks();
 
     const deliveredTaskId = parseTaskPromptId(event.prompt);
@@ -530,7 +556,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_execution_start", async (_event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
     widget.update();
   });
 
@@ -538,6 +564,7 @@ export default function (pi: ExtensionAPI) {
     if (ctx) {
       latestCtx = ctx;
       widget.setUICtx(ctx.ui as UICtx);
+      initializeStoreForContext(ctx);
     }
 
     // TaskExecute requests take priority and release only one live task. If the
@@ -1193,6 +1220,9 @@ ${results.join("\n")}`);
       return matches.length > 0 ? matches : null;
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
+      latestCtx = ctx as unknown as ExtensionContext;
+      widget.setUICtx(ctx.ui as UICtx);
+      initializeStoreForContext(ctx as unknown as ExtensionContext);
       const ui = ctx.ui;
       const trimmed = (args ?? "").trim();
 
@@ -1279,12 +1309,12 @@ ${results.join("\n")}`);
           await mainMenu();
         } else if (choice.startsWith("Clear completed")) {
           store.clearCompleted();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          if (isSessionScope()) deleteSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         } else if (choice.startsWith("Clear all")) {
           store.clearAll();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          if (isSessionScope()) deleteSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         }
@@ -1363,7 +1393,7 @@ ${results.join("\n")}`);
       };
 
       const settingsMenu = (): Promise<void> =>
-        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY);
+        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY, ctx.cwd);
 
       const createTask = async (): Promise<void> => {
         const subject = await ui.input("Task subject");

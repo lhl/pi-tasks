@@ -12,8 +12,10 @@ afterEach(() => { delete process.env.PI_TASKS; });
 function mockCtx(overrides: {
   select?: (...args: any[]) => any;
   sessionManager?: { getSessionId: () => string; getSessionFile?: () => string | undefined };
+  cwd?: string;
 } = {}) {
   return {
+    cwd: overrides.cwd ?? process.cwd(),
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
       getSessionFile: () => "/tmp/test-session.jsonl",

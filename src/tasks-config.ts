@@ -1,12 +1,14 @@
-// <cwd>/.pi/tasks-config.json — persists extension settings across sessions
+// <agent-dir>/tasks-config.json provides global defaults.
+// <workspace>/.pi/tasks-config.json provides project overrides.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type AutoMode = "off" | "cascade" | "auto";
 
 export interface TasksConfig {
-  taskScope?: "memory" | "session" | "project";  // default: "session"
+  taskScope?: "memory" | "session" | "session-global" | "project";  // default: "session"
   /**
    * @deprecated Use {@link autoMode} instead. Retained so older configs keep
    * working — `autoCascade: true` is read as `autoMode: "cascade"`.
@@ -23,19 +25,40 @@ export interface TasksConfig {
    */
   autoMode?: AutoMode;
   autoClearCompleted?: "never" | "on_list_complete" | "on_task_complete";  // default: "on_list_complete"
+  collapseCompleted?: boolean;  // default: false
+  maxVisible?: number;          // default: 10
 }
 
-const CONFIG_PATH = join(process.cwd(), ".pi", "tasks-config.json");
-
-export function loadTasksConfig(): TasksConfig {
+function readTasksConfig(configPath: string): TasksConfig {
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-  } catch { return {}; }
+    const parsed: unknown = JSON.parse(readFileSync(configPath, "utf-8"));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as TasksConfig
+      : {};
+  } catch {
+    return {};
+  }
 }
 
-export function saveTasksConfig(config: TasksConfig): void {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+export function loadGlobalTasksConfig(agentDir = getAgentDir()): TasksConfig {
+  return readTasksConfig(join(agentDir, "tasks-config.json"));
+}
+
+export function loadTasksConfig(cwd: string, agentDir = getAgentDir()): TasksConfig {
+  return {
+    ...loadGlobalTasksConfig(agentDir),
+    ...readTasksConfig(join(cwd, ".pi", "tasks-config.json")),
+  };
+}
+
+export function saveTasksConfig(config: TasksConfig, cwd: string, agentDir = getAgentDir()): void {
+  const configPath = join(cwd, ".pi", "tasks-config.json");
+  const globalConfig = loadGlobalTasksConfig(agentDir);
+  const projectOverrides = Object.fromEntries(
+    Object.entries(config).filter(([key, value]) => globalConfig[key as keyof TasksConfig] !== value),
+  );
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify(projectOverrides, null, 2));
 }
 
 /**
