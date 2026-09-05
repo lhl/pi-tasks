@@ -10,7 +10,7 @@ A [pi](https://pi.dev) extension for structured task tracking and coordination. 
 >
 > - `TaskExecute` no longer spawns subagents via `@tintinweb/pi-subagents`; it schedules sequential follow-up work in the current pi session instead. The whole subagent RPC layer is removed.
 > - New **interactive auto-advance mode** (`/tasks auto`, `autoMode: "auto"`) walks the task list to completion and asks the user about anything still in progress instead of silently retrying.
-> - `TaskCreateMany`, persisted task execution stats (start/end/duration/tokens), and a hardened task store (corrupt-file callback, dir auto-heal, `notFound` results).
+> - `TaskCreateMany`, persisted task execution stats (start/end/agent-active duration/tokens), and a hardened task store (corrupt-file callback, dir auto-heal, `notFound` results).
 > - No more `<system-reminder>` injection into unrelated tool results.
 > - Pi runtime moved to `@earendil-works/*` and `@sinclair/typebox`, peer-depended.
 
@@ -19,21 +19,20 @@ A [pi](https://pi.dev) extension for structured task tracking and coordination. 
 ## Features
 
 - **8 LLM-callable tools** — `TaskCreate`, `TaskCreateMany`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute`.
-- **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers, strikethrough for completed tasks, and a star spinner for active tasks with elapsed time and token counts.
+- **Persistent widget** — live task list above the editor with status icons, task numbers, active-run time and tokens, a configurable row limit, and optional completed-task collapse.
 - **Prompt-injected task execution** — `TaskExecute` schedules tasks in order and releases one follow-up prompt after each agent run. Completed, deleted, and blocked tasks are skipped before enqueueing.
 - **Compact continuation display** — generated task prompts render as a one-line task label in Pi 0.84 or newer; the full prompt remains in model context.
 - **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`). `cascade` selects the next open unblocked task after the agent run ends. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
 - **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references.
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for coordination.
 - **File locking** — concurrent access is safe when multiple sessions share a task list.
-- **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop.
 
 This fork intentionally does **not** inject periodic `<system-reminder>` messages into tool results.
 
 ## Install
 
 ```bash
-pi install npm:@lhl/pi-tasks
+pi install git:github.com/lhl/pi-tasks
 ```
 
 Or load directly for development:
@@ -62,6 +61,8 @@ The extension renders a persistent widget above the editor:
 | `◼` | In-progress |
 | `◻` | Pending |
 | `✳`/`✽` | Animated star spinner — actively executing task |
+
+Task duration counts only time inside Pi agent runs. Time spent waiting for the next user message is excluded. Set `maxVisible` to a positive integer and `collapseCompleted` to `true` under `/tasks` → Settings or in a task config file.
 
 ## Tools
 
@@ -196,10 +197,13 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 | Mode | File | Behaviour |
 |------|------|-----------|
 | `memory` | *(none)* | In-memory only — tasks lost when session ends |
-| `session` **(default)** | `<cwd>/.pi/tasks/tasks-<sessionId>.json` | Per-session file — isolated between sessions, survives resume |
-| `project` | `<cwd>/.pi/tasks/tasks.json` | Shared across all sessions in the project |
+| `session` **(default)** | `<workspace>/.pi/tasks/tasks-<sessionId>.json` | Per-session file in the workspace; survives resume |
+| `session-global` | `<agent-dir>/tasks/sessions/<project-key>/tasks-<sessionId>.json` | Per-session file outside the workspace |
+| `project` | `<workspace>/.pi/tasks/tasks.json` | Shared across sessions in the workspace |
 
-Settings (`taskScope`, `autoMode`, `autoClearCompleted`) are saved to `<cwd>/.pi/tasks-config.json`. The legacy boolean `autoCascade: true` from older versions is still read and mapped to `autoMode: "cascade"` for backward compatibility.
+Task and project-config paths follow the active session's workspace rather than the process launch directory. Under `session-global`, an existing workspace file for the same session remains in use, so changing the setting does not move or strand tasks.
+
+Global defaults are read from `<agent-dir>/tasks-config.json`. Project overrides are saved to `<workspace>/.pi/tasks-config.json` and take precedence key by key. Supported settings are `taskScope`, `autoMode`, `autoClearCompleted`, `collapseCompleted`, and `maxVisible`. The legacy `autoCascade: true` setting maps to `autoMode: "cascade"`.
 
 ### Auto-clear completed tasks
 
@@ -216,7 +220,7 @@ Settings (`taskScope`, `autoMode`, `autoClearCompleted`) are saved to `<cwd>/.pi
 | `PI_TASKS` | `off` | In-memory only (CI/automation) |
 | `PI_TASKS` | `sprint-1` | Named shared list at `~/.pi/tasks/sprint-1.json` |
 | `PI_TASKS` | `/abs/path/tasks.json` | Explicit absolute file path |
-| `PI_TASKS` | `./tasks.json` | Relative path resolved from cwd |
+| `PI_TASKS` | `./tasks.json` | Relative path resolved from the active workspace |
 | *(unset)* | | Uses `taskScope` setting (default: `session`) |
 | `PI_TASKS_DEBUG` | `1` | Trace prompt queueing and debug messages to stderr |
 
@@ -239,7 +243,7 @@ Tasks
 - **Start / Stop auto mode** — toggle interactive auto-advance through the task list.
 - **Clear completed** — remove all completed tasks.
 - **Clear all** — remove all tasks regardless of status.
-- **Settings** — configure task storage, auto-advance mode, and auto-clear completed tasks.
+- **Settings** — configure task storage, auto-advance, completed-task cleanup, completed-task collapse, and the widget row limit.
 
 ### `/tasks auto` subcommand
 
@@ -267,9 +271,10 @@ src/
 ├── index.ts            # Extension entry: tools, /tasks command, widget, prompt execution
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
+├── task-paths.ts       # Workspace and agent-directory task paths
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks
-├── tasks-config.ts     # Config persistence
-├── process-tracker.ts  # Background process output buffering and stop
+├── tasks-config.ts     # Global defaults and project overrides
+├── process-tracker.ts  # Compatibility support for TaskOutput and TaskStop
 └── ui/
     ├── task-widget.ts  # Persistent widget with status icons and spinner
     └── settings-menu.ts  # /tasks → Settings panel

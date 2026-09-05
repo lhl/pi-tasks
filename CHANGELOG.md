@@ -13,17 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Generated task-continuation prompts render as one-line task labels when the host supports display-only Markdown transformers. The model still receives the full task prompt.
+- Global defaults load from `<agent-dir>/tasks-config.json`; project settings remain per-key overrides.
+- The optional `session-global` scope keeps new per-session task files under Pi's agent directory instead of the workspace.
+- `collapseCompleted` and `maxVisible` settings bound the widget without changing model-visible task output.
 
 ### Changed
 - `TaskExecute` schedules ordered work and releases one live task prompt at each agent-run boundary. A later explicit task waits while the active task remains open.
 - Cascade advancement selects the next task after `agent_end` instead of during `TaskUpdate`, so the active run can finish more work before another prompt enters Pi's follow-up queue.
 - A completed list remains visible after its run and is retired before the first task created in a later batch.
+- Project task files, config, and relative `PI_TASKS` paths resolve from `ExtensionContext.cwd`.
+- Task duration accumulates during `agent_start` to `agent_end` intervals and excludes time waiting for user input.
+- Release checks use Node 22, test Pi `0.80.5`, run against Jouzu's Pi `0.84.4` pin, and report compatibility with the latest Pi release without blocking the main job.
 
 ### Fixed
 - Completed, deleted, and newly blocked tasks are discarded before enqueueing instead of producing stale `TaskGet` and `TaskList` turns after the work has finished.
 - Session task state initializes during `session_start`; session replacements reset in-memory queue state, and ephemeral Pi sessions no longer write task files when the host exposes session-file state.
 - File-backed stores validate their envelope, normalize older task records, recover malformed lock files, preserve successor locks, and create directories only on the first write.
 - The task widget advances its spinner only on its timer and contains render errors instead of letting them escape into the host TUI.
+- Package metadata, the lockfile package identity, public-publish settings, and deterministic tarball contents agree on `@lhl/pi-tasks`.
 
 ## [0.6.0] - 2026-05-15
 

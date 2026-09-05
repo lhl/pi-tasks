@@ -1,6 +1,6 @@
 {
   "name": "@lhl/pi-tasks",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A pi extension for structured task tracking, blocker-aware auto-advance, and coordination. Fork of @tintinweb/pi-tasks.",
   "author": "lhl",
   "contributors": [
@@ -15,6 +15,19 @@
   "bugs": {
     "url": "https://github.com/lhl/pi-tasks/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -25,12 +38,12 @@
     "coordination"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": ">=0.80.5",
+    "@earendil-works/pi-tui": ">=0.80.5",
+    "@sinclair/typebox": "^0.34.49"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -40,8 +53,8 @@
   },
   "devDependencies": {
     "@types/node": "^25.0.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
     "@sinclair/typebox": "^0.34.49",
     "typescript": "^6.0.3",
     "@biomejs/biome": "^2.4.13",

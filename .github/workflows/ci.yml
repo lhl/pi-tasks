@@ -6,16 +6,51 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  jouzu-pi:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run test
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: npm audit --audit-level=high
+
+  compat-floor-pi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install minimum supported Pi
+        run: npm install --no-save --ignore-scripts @earendil-works/pi-coding-agent@0.80.5 @earendil-works/pi-tui@0.80.5
+      - run: npm run typecheck
+      - run: npm test
+
+  compat-latest-pi:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install latest Pi
+        run: npm install --no-save --ignore-scripts @earendil-works/pi-coding-agent@latest @earendil-works/pi-tui@latest
+      - run: npm run typecheck
+      - run: npm test
