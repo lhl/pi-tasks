@@ -10,7 +10,7 @@
  *   TaskUpdate   — Update task fields, status, dependencies
  *   TaskOutput   — Get output from a background task process
  *   TaskStop     — Stop a running background task process
- *   TaskExecute  — Queue task prompts in the current session
+ *   TaskExecute  — Schedule task prompts in the current session
  *
  * Commands:
  *   /tasks       — Interactive task management menu
@@ -97,6 +97,13 @@ export default function (pi: ExtensionAPI) {
   const tracker = new ProcessTracker();
   const widget = new TaskWidget(store);
 
+  const registerMarkdownTransformer = (pi as any).registerMarkdownTransformer;
+  if (typeof registerMarkdownTransformer === "function") {
+    registerMarkdownTransformer.call(pi, (markdown: string, context: { messageType: string }) =>
+      context.messageType === "user" ? compactTaskPrompt(markdown) : markdown
+    );
+  }
+
   function onCorruptFile(filePath: string, error: unknown) {
     debug("corrupt task store", { filePath, error });
     latestCtx?.ui.notify(
@@ -112,6 +119,10 @@ export default function (pi: ExtensionAPI) {
   let promptExecutionConfig: { additionalContext?: string } = {};
   /** Tasks that already have a follow-up prompt queued in this session. */
   const queuedTaskIds = new Set<string>();
+  /** Explicit TaskExecute requests waiting to be released one at a time. */
+  const scheduledTaskPrompts: Array<{ taskId: string; additionalContext?: string }> = [];
+  /** Explicit task whose prompt was released and has not reached a terminal state. */
+  let activeScheduledTaskId: string | undefined;
   /** Guardrail to prevent runaway auto-continue loops on the same unfinished task. */
   const autoPromptAttempts = new Map<string, number>();
   /** Re-entrancy guard for the interactive auto-mode prompt. */
@@ -138,6 +149,23 @@ export default function (pi: ExtensionAPI) {
   function parseTaskPromptId(text: unknown): string | undefined {
     if (typeof text !== "string") return undefined;
     return text.match(/^Continue by working on task #(\d+):/)?.[1];
+  }
+
+  /** Render generated task continuations as one line without changing model context. */
+  function compactTaskPrompt(markdown: string): string {
+    const match = markdown.match(/^Continue by working on task #(\d+): "([^\n]+)"(?:\r?\n){2}/);
+    if (!match) return markdown;
+    return `Task #${match[1]} · ${match[2]}`;
+  }
+
+  function getMessageText(message: any): string | undefined {
+    if (typeof message?.content === "string") return message.content;
+    if (!Array.isArray(message?.content)) return undefined;
+    const text = message.content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n");
+    return text || undefined;
   }
 
   /** Build a follow-up user prompt for work on a task.
@@ -236,6 +264,39 @@ export default function (pi: ExtensionAPI) {
       additionalContext: promptExecutionConfig.additionalContext,
       reason,
     });
+  }
+
+  /** Release one explicit TaskExecute request after the preceding agent run ends. */
+  function advanceScheduledTaskPrompts(reason: string): "queued" | "waiting" | "empty" {
+    if (activeScheduledTaskId) {
+      const active = store.get(activeScheduledTaskId);
+      if (active?.status === "in_progress" && getOpenBlockers(active).length === 0) {
+        return "waiting";
+      }
+      activeScheduledTaskId = undefined;
+    }
+
+    while (scheduledTaskPrompts.length > 0) {
+      const scheduled = scheduledTaskPrompts.shift()!;
+      const task = store.get(scheduled.taskId);
+      if (!task || task.status === "completed" || getOpenBlockers(task).length > 0) {
+        debug("skipped stale scheduled task prompt", { taskId: scheduled.taskId, reason });
+        continue;
+      }
+
+      const outcome = queueTaskPrompt(task, {
+        additionalContext: scheduled.additionalContext,
+        explicit: true,
+        reason,
+      });
+      if (outcome.queued) {
+        activeScheduledTaskId = task.id;
+        return "queued";
+      }
+      debug("could not queue scheduled task prompt", { taskId: scheduled.taskId, message: outcome.message });
+    }
+
+    return "empty";
   }
 
   /**
@@ -351,7 +412,11 @@ export default function (pi: ExtensionAPI) {
   function upgradeStoreIfNeeded(ctx: ExtensionContext) {
     if (storeUpgraded) return;
     if (taskScope === "session" && !piTasks) {
-      const sessionId = ctx.sessionManager.getSessionId();
+      const sessionManager = ctx.sessionManager as any;
+      const hasSessionFileApi = typeof sessionManager.getSessionFile === "function";
+      const sessionId = !hasSessionFileApi || sessionManager.getSessionFile()
+        ? ctx.sessionManager.getSessionId()
+        : undefined;
       const path = resolveStorePath(sessionId);
       store = new TaskStore(path);
       store.onCorruptFile = onCorruptFile;
@@ -387,7 +452,10 @@ export default function (pi: ExtensionAPI) {
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     const autoClearResult = autoClear.onTurnStart(currentTurn);
-    if (autoClearResult.cleared) widget.update();
+    if (autoClearResult.cleared) {
+      if (taskScope === "session") store.deleteFileIfEmpty();
+      widget.update();
+    }
   });
 
   // ── Token usage tracking ──
@@ -404,89 +472,58 @@ export default function (pi: ExtensionAPI) {
     latestCtx = undefined;
   });
 
-  // Intercept extension-generated task prompts before they reach the model.
-  // A follow-up prompt can sit in pi's queue while a user or another turn marks
-  // the task complete/deleted/blocked. Treat those prompts as stale instead of
-  // spending another model turn on already-finished work.
-  pi.on("input", async (event, ctx) => {
-    latestCtx = ctx;
-    widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
-
-    const deliveredTaskId = parseTaskPromptId(event.text);
-    if (!deliveredTaskId) {
-      showPersistedTasks();
-      return { action: "continue" as const };
-    }
-
-    queuedTaskIds.delete(deliveredTaskId);
-    const task = store.get(deliveredTaskId);
-    let staleReason: string | undefined;
-    if (!task) {
-      staleReason = `task #${deliveredTaskId} no longer exists`;
-    } else if (task.status === "completed") {
-      staleReason = `task #${deliveredTaskId} is already completed`;
-    } else {
-      const openBlockers = getOpenBlockers(task);
-      if (openBlockers.length > 0) {
-        staleReason = `task #${deliveredTaskId} is blocked by ${openBlockers.map(id => "#" + id).join(", ")}`;
-      }
-    }
-
-    if (!staleReason) return { action: "continue" as const };
-
-    autoPromptAttempts.delete(deliveredTaskId);
-    widget.setActiveTask(deliveredTaskId, false);
-    widget.update();
-    ctx.ui.notify(`Skipping stale task prompt: ${staleReason}.`, "info");
-    if (getAutoMode(cfg) !== "off") {
-      await autoAdvance(ctx, "stale_task_prompt");
-    }
-    return { action: "handled" as const };
+  // Arm completed-list retirement only after retries, compaction, and queued
+  // continuations have all finished.
+  pi.on("agent_settled" as any, async () => {
+    autoClear.onRunEnded();
   });
 
-  // Grab UI context early — before_agent_start fires before any tool calls,
-  // so persisted tasks show up immediately on session start.
+  // Initialize and restore task state before the first user prompt. Pi emits
+  // session_start for startup, reload, new, resume, and fork transitions.
+  pi.on("session_start", async (event, ctx) => {
+    latestCtx = ctx;
+    widget.setUICtx(ctx.ui as UICtx);
+
+    const reason = event.reason;
+    const isSwitch = reason === "new" || reason === "resume" || reason === "fork";
+    const forkSeed = reason === "fork" ? store.snapshot() : undefined;
+    if (isSwitch) {
+      storeUpgraded = false;
+      persistedTasksShown = false;
+      currentTurn = 0;
+      queuedTaskIds.clear();
+      scheduledTaskPrompts.length = 0;
+      activeScheduledTaskId = undefined;
+      autoPromptAttempts.clear();
+      promptExecutionConfig = {};
+      autoClear.reset();
+      if (reason === "new" && (taskScope === "memory" || piTasks === "off")) store.clearAll();
+    }
+
+    upgradeStoreIfNeeded(ctx);
+    if (forkSeed?.tasks.length) store.seed(forkSeed);
+    const keepsTasks = reason === "reload" || reason === "resume" || reason === "fork";
+    showPersistedTasks(keepsTasks);
+    if (keepsTasks) autoClear.onRunEnded();
+  });
+
+  // message_start is the delivery-time signal for queued prompts. The input
+  // event fires when sendUserMessage enqueues them, which is too early.
+  pi.on("message_start", async (event) => {
+    if ((event.message as any)?.role !== "user") return;
+    const deliveredTaskId = parseTaskPromptId(getMessageText(event.message));
+    if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
+  });
+
+  // Fallback for hosts that initialize extension UI lazily.
   pi.on("before_agent_start", async (event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     showPersistedTasks();
 
-    // A queued follow-up is no longer merely queued once pi starts processing it.
-    // Clearing here lets auto-continue retry still-open work after the turn ends,
-    // subject to AUTO_CONTINUE_MAX_ATTEMPTS. The input handler already performs
-    // this for normal delivery; keep this as a fallback for older pi versions or
-    // non-standard prompt injection paths that bypass input events.
     const deliveredTaskId = parseTaskPromptId(event.prompt);
     if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
-  });
-
-  // session_switch fires on /new (reason: "new") and /resume (reason: "resume").
-  // On /new: reset all session-scoped state so the store switches to the new session file.
-  // On resume: reload persisted tasks from the existing session file.
-  pi.on("session_switch" as any, async (event: any, ctx: ExtensionContext) => {
-    latestCtx = ctx;
-    widget.setUICtx(ctx.ui as UICtx);
-
-    const isResume = event?.reason === "resume";
-
-    // Reset session-scoped state for both /new and /resume
-    storeUpgraded = false;
-    persistedTasksShown = false;
-    currentTurn = 0;
-    queuedTaskIds.clear();
-    autoPromptAttempts.clear();
-    promptExecutionConfig = {};
-    autoClear.reset();
-
-    // Memory mode has no file-backed store to switch — clear explicitly on /new
-    if (!isResume && taskScope === "memory") {
-      store.clearAll();
-    }
-
-    upgradeStoreIfNeeded(ctx);
-    showPersistedTasks(isResume);
   });
 
   // Keep widget context fresh on every tool execution as well.
@@ -502,13 +539,19 @@ export default function (pi: ExtensionAPI) {
       latestCtx = ctx;
       widget.setUICtx(ctx.ui as UICtx);
     }
+
+    // TaskExecute requests take priority and release only one live task. If the
+    // preceding explicit task remains open, stop rather than running later tasks.
+    const scheduledState = advanceScheduledTaskPrompts("agent_end");
+    if (scheduledState !== "empty") return;
+
     const ctxForUI = ctx ?? latestCtx;
     const mode = getAutoMode(cfg);
     if (mode === "off") return;
     if (mode === "auto" && ctxForUI) {
       await autoAdvance(ctxForUI, "agent_end");
     } else {
-      // Cascade (or auto without a usable UI ctx) — fall back to silent queueing.
+      // Cascade (or auto without a usable UI ctx) queues from live end-of-run state.
       queueNextOpenTask("agent_end");
     }
   });
@@ -575,7 +618,7 @@ All tasks are created with status \`pending\`.
     }),
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      autoClear.resetBatchCountdown();
+      autoClear.startNewBatch();
       const meta = params.metadata ?? {};
       if (params.agentType) meta.agentType = params.agentType;
       const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined);
@@ -635,7 +678,7 @@ Skip using this tool when:
     }),
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      autoClear.resetBatchCountdown();
+      autoClear.startNewBatch();
       const items = params.tasks.map(t => {
         const meta = t.metadata ?? {};
         if (t.agentType) meta.agentType = t.agentType;
@@ -926,8 +969,8 @@ Set up task dependencies:
         return Promise.resolve(textResult(`Task #${taskId} not found`));
       }
 
-      // Update widget active task tracking
-      let queuedNext: { queued: boolean; message: string } | undefined;
+      // Update widget active task tracking. Automatic continuation waits for
+      // agent_end so the current run can finish or complete more tasks first.
       if (fields.status === "in_progress") {
         widget.setActiveTask(taskId);
         autoClear.resetBatchCountdown();
@@ -942,7 +985,6 @@ Set up task dependencies:
         widget.setActiveTask(taskId, false);
         if (fields.status === "completed") {
           autoClear.trackCompletion(taskId, currentTurn);
-          queuedNext = queueNextOpenTask("task_completed");
         }
       }
 
@@ -951,8 +993,6 @@ Set up task dependencies:
       if (warnings.length > 0) {
         msg += ` (warning: ${warnings.join("; ")})`;
       }
-      if (queuedNext?.queued) msg += `
-${queuedNext.message}`;
       return Promise.resolve(textResult(msg));
     },
   });
@@ -1048,10 +1088,8 @@ ${String(task.metadata.result)}` : "";
       autoPromptAttempts.delete(taskId);
       autoClear.trackCompletion(taskId, currentTurn);
       widget.setActiveTask(taskId, false);
-      const queuedNext = queueNextOpenTask("task_stopped");
       widget.update();
-      return textResult(`Task #${taskId} stopped successfully${queuedNext?.queued ? `
-${queuedNext.message}` : ""}`);
+      return textResult(`Task #${taskId} stopped successfully`);
     },
   });
 
@@ -1062,30 +1100,30 @@ ${queuedNext.message}` : ""}`);
   pi.registerTool({
     name: "TaskExecute",
     label: "TaskExecute",
-    description: `Queue one or more tasks as follow-up prompts in the current pi session.
+    description: `Schedule one or more tasks for sequential follow-up work in the current pi session.
 
 ## When to Use This Tool
 
 - To start or resume task work without launching a separate agent
 - Tasks must be pending or in_progress with all blockedBy dependencies completed
-- Each queued task is delivered as a follow-up user message to the current agent/session
+- The extension rechecks live task state at each agent boundary and releases at most one prompt
 
 ## Parameters
 
-- **task_ids**: Array of task IDs to queue
+- **task_ids**: Ordered task IDs to schedule
 - **additional_context**: Extra context appended to each task prompt`,
     promptGuidelines: [
-      "TaskExecute queues follow-up prompts in the current session; do not launch separate agents for these tasks.",
+      "TaskExecute schedules sequential follow-up work in the current session; do not launch separate agents for these tasks.",
     ],
     parameters: Type.Object({
-      task_ids: Type.Array(Type.String(), { description: "Task IDs to queue as follow-up prompts" }),
+      task_ids: Type.Array(Type.String(), { description: "Ordered task IDs to schedule" }),
       additional_context: Type.Optional(Type.String({ description: "Extra context for task prompts" })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       promptExecutionConfig = { additionalContext: params.additional_context };
       const results: string[] = [];
-      const queued: string[] = [];
+      const scheduled: string[] = [];
 
       for (const taskId of params.task_ids) {
         const task = store.get(taskId);
@@ -1097,23 +1135,30 @@ ${queuedNext.message}` : ""}`);
           results.push(`#${taskId}: already completed`);
           continue;
         }
+        const openBlockers = getOpenBlockers(task);
+        if (openBlockers.length > 0) {
+          results.push(`#${taskId}: blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
+          continue;
+        }
+        const alreadyScheduled = activeScheduledTaskId === taskId
+          || queuedTaskIds.has(taskId)
+          || scheduledTaskPrompts.some(item => item.taskId === taskId);
+        if (alreadyScheduled) {
+          results.push(`#${taskId}: already scheduled`);
+          continue;
+        }
 
-        const outcome = queueTaskPrompt(task, {
-          additionalContext: params.additional_context,
-          explicit: true,
-          reason: "TaskExecute",
-        });
-        if (outcome.queued) queued.push(outcome.message);
-        else results.push(outcome.message);
+        scheduledTaskPrompts.push({ taskId, additionalContext: params.additional_context });
+        scheduled.push(`#${taskId} → scheduled`);
       }
 
       const lines: string[] = [];
-      if (queued.length > 0) {
+      if (scheduled.length > 0) {
         lines.push(
-          `Queued ${queued.length} task prompt(s):
-${queued.join("\n")}
+          `Scheduled ${scheduled.length} task(s) for sequential follow-up work:
+${scheduled.join("\n")}
 ` +
-          `The current session will receive them as follow-up user messages.`,
+          `The next live task will start after the current agent run ends.`,
         );
       }
       if (results.length > 0) lines.push(`Skipped:
@@ -1326,6 +1371,7 @@ ${results.join("\n")}`);
         const description = await ui.input("Task description");
         if (!description) return mainMenu();
 
+        autoClear.startNewBatch();
         store.create(subject, description);
         widget.update();
         return mainMenu();

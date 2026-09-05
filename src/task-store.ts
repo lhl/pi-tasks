@@ -5,6 +5,7 @@
  * Shared (PI_TASK_LIST_ID set): ~/.pi/tasks/<listId>.json with file locking.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -14,20 +15,23 @@ const TASKS_DIR = join(homedir(), ".pi", "tasks");
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100; // 5s max
 
-/** Simple file-based locking. */
-function acquireLock(lockPath: string): void {
+/** Acquire a file lock and return the unique token written into it. */
+function acquireLock(lockPath: string): string {
   ensureDir(lockPath);
+  const token = `${process.pid}:${randomUUID()}`;
+
   for (let i = 0; i < LOCK_MAX_RETRIES; i++) {
     try {
       // O_EXCL: fail if file exists
-      writeFileSync(lockPath, `${process.pid}`, { flag: "wx" });
-      return;
+      writeFileSync(lockPath, token, { flag: "wx" });
+      return token;
     } catch (e: any) {
       if (e.code === "EEXIST") {
         // Check for stale lock (process no longer running)
         try {
           const pid = parseInt(readFileSync(lockPath, "utf-8"), 10);
-          if (pid && !isProcessRunning(pid)) {
+          // Give a live writer two polls to fill a newly created lock file.
+          if (pid > 0 ? !isProcessRunning(pid) : i >= 2) {
             unlinkSync(lockPath);
             continue;
           }
@@ -43,8 +47,11 @@ function acquireLock(lockPath: string): void {
   throw new Error(`Failed to acquire lock: ${lockPath}`);
 }
 
-function releaseLock(lockPath: string): void {
-  try { unlinkSync(lockPath); } catch { /* ignore */ }
+/** Release a lock only if its token still belongs to this holder. */
+function releaseLock(lockPath: string, token: string): void {
+  try {
+    if (readFileSync(lockPath, "utf-8") === token) unlinkSync(lockPath);
+  } catch { /* ignore — already gone */ }
 }
 
 function isProcessRunning(pid: number): boolean {
@@ -53,6 +60,21 @@ function isProcessRunning(pid: number): boolean {
 
 function ensureDir(filePath: string): void {
   mkdirSync(dirname(filePath), { recursive: true });
+}
+
+/** Fill fields omitted by older or hand-edited task records. */
+function normalizeTask(task: Task): Task {
+  const now = Date.now();
+  return {
+    ...task,
+    metadata: task.metadata && typeof task.metadata === "object" && !Array.isArray(task.metadata)
+      ? task.metadata
+      : {},
+    blocks: Array.isArray(task.blocks) ? task.blocks : [],
+    blockedBy: Array.isArray(task.blockedBy) ? task.blockedBy : [],
+    createdAt: typeof task.createdAt === "number" ? task.createdAt : now,
+    updatedAt: typeof task.updatedAt === "number" ? task.updatedAt : now,
+  };
 }
 
 export class TaskStore {
@@ -68,7 +90,7 @@ export class TaskStore {
     if (!listIdOrPath) return;
     const isAbsPath = isAbsolute(listIdOrPath);
     const filePath = isAbsPath ? listIdOrPath : join(TASKS_DIR, `${listIdOrPath}.json`);
-    ensureDir(filePath);
+    // The first mutation creates the directory. Read-only sessions leave no files.
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
     this.load();
@@ -79,12 +101,26 @@ export class TaskStore {
     if (!this.filePath) return;
     if (!existsSync(this.filePath)) return;
     try {
-      const data: TaskStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
-      this.nextId = data.nextId;
-      this.tasks.clear();
-      for (const t of data.tasks) {
-        this.tasks.set(t.id, t);
+      const data: unknown = JSON.parse(readFileSync(this.filePath, "utf-8"));
+      if (!data || typeof data !== "object") throw new Error("task store must contain an object");
+      const { nextId, tasks } = data as Partial<TaskStoreData>;
+      if (!Array.isArray(tasks)) throw new Error("task store is missing its tasks array");
+
+      // Build the replacement before touching live state so one bad record cannot
+      // leave an existing in-memory list half-loaded.
+      const loaded = new Map<string, Task>();
+      let maxId = 0;
+      for (const task of tasks) {
+        if (!task || typeof task !== "object" || typeof task.id !== "string") continue;
+        loaded.set(task.id, normalizeTask(task));
+        const numericId = Number(task.id);
+        if (Number.isFinite(numericId) && numericId > maxId) maxId = numericId;
       }
+
+      this.tasks = loaded;
+      this.nextId = typeof nextId === "number" && Number.isInteger(nextId) && nextId > maxId
+        ? nextId
+        : maxId + 1;
     } catch (err: any) {
       if (err?.code === "ENOENT") return;
       this.onCorruptFile?.(this.filePath, err);
@@ -108,14 +144,14 @@ export class TaskStore {
   /** Execute a mutation with file locking (if file-backed). */
   private withLock<T>(fn: () => T): T {
     if (!this.lockPath) return fn();
-    acquireLock(this.lockPath);
+    const token = acquireLock(this.lockPath);
     try {
       this.load(); // Re-read latest state
       const result = fn();
       this.save();
       return result;
     } finally {
-      releaseLock(this.lockPath);
+      releaseLock(this.lockPath, token);
     }
   }
 
@@ -307,6 +343,22 @@ export class TaskStore {
       const count = this.tasks.size;
       this.tasks.clear();
       return count;
+    });
+  }
+
+  /** Capture the full store state for a forked session. */
+  snapshot(): TaskStoreData {
+    if (this.filePath) this.load();
+    return { nextId: this.nextId, tasks: Array.from(this.tasks.values()) };
+  }
+
+  /** Seed an empty store without overwriting an existing task list. */
+  seed(data: TaskStoreData): void {
+    if (this.tasks.size > 0) return;
+    this.withLock(() => {
+      if (this.tasks.size > 0) return;
+      this.nextId = data.nextId;
+      for (const task of data.tasks) this.tasks.set(task.id, normalizeTask(task));
     });
   }
 

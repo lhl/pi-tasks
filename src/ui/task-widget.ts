@@ -245,15 +245,27 @@ export class TaskWidget {
     }
   }
 
-  /** Ensure the widget update timer is running. */
+  /** Ensure the widget update timer is running and owns spinner advancement. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 150);
+      this.widgetInterval = setInterval(() => {
+        this.widgetFrame++;
+        this.update();
+      }, 150);
     }
   }
 
-  /** Build widget lines from current live state. Called from the render callback. */
+  /** Keep widget failures from escaping the TUI render timer. */
   private renderWidget(tui: any, theme: Theme): string[] {
+    try {
+      return this.buildWidgetLines(tui, theme);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Build widget lines from current live state. */
+  private buildWidgetLines(tui: any, theme: Theme): string[] {
     const tasks = this.store.list();
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w);
@@ -376,8 +388,6 @@ export class TaskWidget {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
-
-    this.widgetFrame++;
 
     // Transition: hidden → visible — register widget callback once
     if (!this.widgetRegistered) {

@@ -9,9 +9,15 @@ import initExtension from "../src/index.js";
 beforeEach(() => { process.env.PI_TASKS = "off"; });
 afterEach(() => { delete process.env.PI_TASKS; });
 
-function mockCtx(overrides: { select?: (...args: any[]) => any } = {}) {
+function mockCtx(overrides: {
+  select?: (...args: any[]) => any;
+  sessionManager?: { getSessionId: () => string; getSessionFile?: () => string | undefined };
+} = {}) {
   return {
-    sessionManager: { getSessionId: () => "test-session" },
+    sessionManager: overrides.sessionManager ?? {
+      getSessionId: () => "test-session",
+      getSessionFile: () => "/tmp/test-session.jsonl",
+    },
     model: { id: "test-model", name: "Test" },
     modelRegistry: {},
     ui: {
@@ -30,10 +36,14 @@ function mockPi() {
   const commands = new Map<string, any>();
   const eventHandlers = new Map<string, ((data: unknown) => void)[]>();
   const lifecycleHandlers = new Map<string, ((...args: any[]) => any)[]>();
+  const markdownTransformers: Array<(markdown: string, context: { messageType: string }) => string> = [];
 
   const pi = {
     registerTool(def: any) { tools.set(def.name, def); },
     registerCommand(name: string, def: any) { commands.set(name, def); },
+    registerMarkdownTransformer(transformer: (markdown: string, context: { messageType: string }) => string) {
+      markdownTransformers.push(transformer);
+    },
     on(event: string, handler: any) {
       if (!lifecycleHandlers.has(event)) lifecycleHandlers.set(event, []);
       lifecycleHandlers.get(event)!.push(handler);
@@ -72,6 +82,12 @@ function mockPi() {
     },
     emitEvent(channel: string, data: unknown) {
       pi.events.emit(channel, data);
+    },
+    transformMarkdown(markdown: string, messageType = "user") {
+      return markdownTransformers.reduce(
+        (result, transformer) => transformer(result, { messageType }),
+        markdown,
+      );
     },
   };
 }
@@ -120,7 +136,7 @@ describe("TaskExecute prompt injection", () => {
     expect(details.content[0].text).toContain('"area":"test"');
   });
 
-  it("queues a follow-up user prompt for a valid task", async () => {
+  it("releases a valid task prompt after the current agent run", async () => {
     await mock.executeTool("TaskCreate", {
       subject: "Run tests",
       description: "Run the test suite",
@@ -128,8 +144,11 @@ describe("TaskExecute prompt injection", () => {
 
     const result = await mock.executeTool("TaskExecute", { task_ids: ["1"] });
 
-    expect(result.content[0].text).toContain("Queued 1 task prompt");
-    expect(result.content[0].text).toContain("#1 → queued follow-up prompt");
+    expect(result.content[0].text).toContain("Scheduled 1 task");
+    expect(result.content[0].text).toContain("#1 → scheduled");
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
     expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
     expect(mock.pi.sendUserMessage).toHaveBeenCalledWith(
       expect.stringContaining("Continue by working on task #1"),
@@ -147,7 +166,7 @@ describe("TaskExecute prompt injection", () => {
     });
 
     const result = await mock.executeTool("TaskExecute", { task_ids: ["1"] });
-    expect(result.content[0].text).toContain("Queued 1 task prompt");
+    expect(result.content[0].text).toContain("Scheduled 1 task");
     expect(result.content[0].text).not.toContain("no agentType");
   });
 
@@ -161,8 +180,60 @@ describe("TaskExecute prompt injection", () => {
       task_ids: ["1"],
       additional_context: "Focus on REST endpoints only",
     });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
     expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Focus on REST endpoints only");
+  });
+
+  it("renders generated task prompts as one line without changing assistant text", async () => {
+    const prompt = "Continue by working on task #7: \"Run tests\"\n\nLong instructions";
+
+    expect(mock.transformMarkdown(prompt)).toBe("Task #7 · Run tests");
+    expect(mock.transformMarkdown(prompt, "assistant")).toBe(prompt);
+  });
+
+  it("releases bulk TaskExecute requests one at a time", async () => {
+    await mock.executeTool("TaskCreateMany", {
+      tasks: [
+        { subject: "First", description: "Do first" },
+        { subject: "Second", description: "Do second" },
+      ],
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1", "2"] });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("task #1");
+
+    const firstPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    await mock.fireLifecycle("message_start", {
+      message: { role: "user", content: [{ type: "text", text: firstPrompt }] },
+    }, mockCtx());
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(mock.pi.sendUserMessage.mock.calls[1][0]).toContain("task #2");
+  });
+
+  it("does not release a later explicit task while the active task is open", async () => {
+    await mock.executeTool("TaskCreateMany", {
+      tasks: [
+        { subject: "First", description: "Do first" },
+        { subject: "Second", description: "Do second" },
+      ],
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1", "2"] });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    const firstPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    await mock.fireLifecycle("message_start", {
+      message: { role: "user", content: [{ type: "text", text: firstPrompt }] },
+    }, mockCtx());
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
   });
 
   it("rejects non-existent, completed, and blocked tasks", async () => {
@@ -183,6 +254,7 @@ describe("TaskExecute prompt injection", () => {
   it("TaskOutput reports prompt-queued task status without a background process", async () => {
     await mock.executeTool("TaskCreate", { subject: "Prompt task", description: "Desc" });
     await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
     const result = await mock.executeTool("TaskOutput", { task_id: "1", block: false, timeout: 0 });
     expect(result.content[0].text).toContain("Task #1 [in_progress]");
@@ -202,6 +274,73 @@ describe("TaskExecute prompt injection", () => {
 
     expect(results.filter(Boolean)).toHaveLength(0);
     expect(JSON.stringify(results)).not.toContain("system-reminder");
+  });
+});
+
+describe("Session lifecycle", () => {
+  it("shows in-memory tasks during session_start", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Visible", description: "Desc" });
+
+    const ctx = mockCtx();
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+    expect(ctx.ui.setWidget).toHaveBeenCalledWith(
+      "tasks",
+      expect.any(Function),
+      { placement: "aboveEditor" },
+    );
+  });
+
+  it("clears memory-scoped tasks for a new session", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Old", description: "Desc" });
+
+    await mock.fireLifecycle("session_start", { reason: "new" }, mockCtx());
+    const result = await mock.executeTool("TaskList", {});
+
+    expect(result.content[0].text).toContain("No tasks found");
+  });
+
+  it("starts a later task batch without the preceding completed list", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Finished", description: "Desc" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    await mock.fireLifecycle("agent_settled", {}, mockCtx());
+
+    await mock.executeTool("TaskCreate", { subject: "Fresh", description: "Desc" });
+    const result = await mock.executeTool("TaskList", {});
+
+    expect(result.content[0].text).toContain("Fresh");
+    expect(result.content[0].text).not.toContain("Finished");
+  });
+
+  it("does not persist session tasks when the conversation has no session file", async () => {
+    delete process.env.PI_TASKS;
+    await removeConfig();
+    const sessionId = `ephemeral-${Date.now()}`;
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const taskFile = path.join(process.cwd(), ".pi", "tasks", `tasks-${sessionId}.json`);
+    try {
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+      const ctx = mockCtx({
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => undefined,
+        },
+      });
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.executeTool("TaskCreate", { subject: "Ephemeral", description: "Desc" }, ctx);
+
+      expect(fs.existsSync(taskFile)).toBe(false);
+    } finally {
+      try { fs.unlinkSync(taskFile); } catch {}
+    }
   });
 });
 
@@ -237,7 +376,10 @@ describe("Auto-continue with prompts", () => {
       metadata: { result: "The answer is 42" },
     });
 
-    expect(result.content[0].text).toContain("#2 → queued follow-up prompt");
+    expect(result.content[0].text).not.toContain("queued follow-up prompt");
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
     expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
     const prompt = mock.pi.sendUserMessage.mock.calls[0][0];
     expect(prompt).toContain("Continue by working on task #2");
@@ -269,76 +411,44 @@ describe("Auto-continue with prompts", () => {
     expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
   });
 
-  it("handles stale queued prompts for already completed tasks before agent start", async () => {
-    const mock = mockPi();
-    initExtension(mock.pi as any);
-
-    await mock.executeTool("TaskCreate", { subject: "Open task", description: "Do it" });
-    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
-    const queuedPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
-    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
-
-    const ctx = mockCtx();
-    const results = await mock.fireLifecycle(
-      "input",
-      { text: queuedPrompt, source: "extension" },
-      ctx,
-    );
-
-    expect(results).toEqual([{ action: "handled" }]);
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("task #1 is already completed"),
-      "info",
-    );
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-  });
-
-  it("handles stale queued prompts for deleted tasks before agent start", async () => {
-    const mock = mockPi();
-    initExtension(mock.pi as any);
-
-    await mock.executeTool("TaskCreate", { subject: "Obsolete task", description: "Do it" });
-    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
-    const queuedPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
-    await mock.executeTool("TaskUpdate", { taskId: "1", status: "deleted" });
-
-    const ctx = mockCtx();
-    const results = await mock.fireLifecycle(
-      "input",
-      { text: queuedPrompt, source: "extension" },
-      ctx,
-    );
-
-    expect(results).toEqual([{ action: "handled" }]);
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("task #1 no longer exists"),
-      "info",
-    );
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-  });
-
-  it("does not re-queue stale completed prompts when cascade already advanced", async () => {
+  it("queues nothing when cascade tasks all finish in the same agent run", async () => {
     await writeConfig({ autoMode: "cascade" });
     const mock = mockPi();
     initExtension(mock.pi as any);
 
     await mock.executeTool("TaskCreate", { subject: "First", description: "Do it" });
     await mock.executeTool("TaskCreate", { subject: "Second", description: "Do next" });
-    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
-    const stalePrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
-
+    await mock.executeTool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(mock.pi.sendUserMessage.mock.calls[1][0]).toContain("Continue by working on task #2");
+    await mock.executeTool("TaskUpdate", { taskId: "2", status: "completed" });
 
-    const results = await mock.fireLifecycle(
-      "input",
-      { text: stalePrompt, source: "extension" },
-      mockCtx(),
-    );
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
 
-    expect(results).toEqual([{ action: "handled" }]);
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  it("drops an explicit task completed before the run boundary", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Open task", description: "Do it" });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("drops an explicit task deleted before the run boundary", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "Obsolete task", description: "Do it" });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "deleted" });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("can retry a delivered prompt for still-open work, capped per task", async () => {
@@ -348,11 +458,15 @@ describe("Auto-continue with prompts", () => {
 
     await mock.executeTool("TaskCreate", { subject: "Open task", description: "Do it" });
 
+    let delivered = 0;
     for (let i = 0; i < 4; i++) {
       await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-      const prompt = mock.pi.sendUserMessage.mock.calls.at(-1)?.[0] as string;
-      if (prompt) {
-        await mock.fireLifecycle("before_agent_start", { prompt }, mockCtx());
+      if (mock.pi.sendUserMessage.mock.calls.length > delivered) {
+        const prompt = mock.pi.sendUserMessage.mock.calls[delivered][0] as string;
+        delivered++;
+        await mock.fireLifecycle("message_start", {
+          message: { role: "user", content: [{ type: "text", text: prompt }] },
+        }, mockCtx());
       }
     }
 

@@ -17,6 +17,8 @@ export class AutoClearManager {
   private completedAtTurn = new Map<string, number>();
   /** Turn when ALL tasks became completed ("on_list_complete" mode). */
   private allCompletedAtTurn: number | null = null;
+  /** Whether an agent run ended after this list was last extended. */
+  private runEnded = false;
 
   constructor(
     private getStore: () => TaskStore,
@@ -47,15 +49,35 @@ export class AutoClearManager {
     }
   }
 
-  /** Reset batch countdown (e.g., when a new task is created or task goes non-completed). */
+  /** Reset batch countdown when a task returns to an open state. */
   resetBatchCountdown(): void {
     this.allCompletedAtTurn = null;
+  }
+
+  /** Mark the boundary after all retries, compaction, and queued work settle. */
+  onRunEnded(): void {
+    this.runEnded = true;
+  }
+
+  /** Retire a completed list before creating the first task of a later run. */
+  startNewBatch(): void {
+    this.allCompletedAtTurn = null;
+    const afterFinishedRun = this.runEnded;
+    this.runEnded = false;
+    if (!afterFinishedRun || this.getMode() === "never") return;
+
+    const tasks = this.getStore().list();
+    if (tasks.length > 0 && tasks.every(task => task.status === "completed")) {
+      this.getStore().clearCompleted();
+      this.completedAtTurn.clear();
+    }
   }
 
   /** Reset all tracking state (e.g., on new session). */
   reset(): void {
     this.completedAtTurn.clear();
     this.allCompletedAtTurn = null;
+    this.runEnded = false;
   }
 
   /**

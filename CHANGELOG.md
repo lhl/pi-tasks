@@ -11,8 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Generated task-continuation prompts render as one-line task labels when the host supports display-only Markdown transformers. The model still receives the full task prompt.
+
+### Changed
+- `TaskExecute` schedules ordered work and releases one live task prompt at each agent-run boundary. A later explicit task waits while the active task remains open.
+- Cascade advancement selects the next task after `agent_end` instead of during `TaskUpdate`, so the active run can finish more work before another prompt enters Pi's follow-up queue.
+- A completed list remains visible after its run and is retired before the first task created in a later batch.
+
 ### Fixed
-- Auto-advance now intercepts stale task follow-up prompts before they reach the model. If a queued prompt targets a task that was completed, deleted, or became blocked while waiting in pi's follow-up queue, the extension marks that prompt handled, clears its queued/attempt bookkeeping, and advances to the next valid task when auto mode is enabled.
+- Completed, deleted, and newly blocked tasks are discarded before enqueueing instead of producing stale `TaskGet` and `TaskList` turns after the work has finished.
+- Session task state initializes during `session_start`; session replacements reset in-memory queue state, and ephemeral Pi sessions no longer write task files when the host exposes session-file state.
+- File-backed stores validate their envelope, normalize older task records, recover malformed lock files, preserve successor locks, and create directories only on the first write.
+- The task widget advances its spinner only on its timer and contains render errors instead of letting them escape into the host TUI.
 
 ## [0.6.0] - 2026-05-15
 

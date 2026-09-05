@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -520,5 +520,102 @@ describe("TaskStore durability safeguards", () => {
     } finally {
       try { rmSync(dir, { recursive: true, force: true }); } catch {}
     }
+  });
+
+  it("normalizes legacy task records on load", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-tasks-legacy-"));
+    const filePath = join(dir, "tasks.json");
+    try {
+      writeFileSync(filePath, JSON.stringify({
+        nextId: 2,
+        tasks: [{ id: "1", subject: "Legacy", description: "Desc", status: "pending" }],
+      }));
+
+      const task = new TaskStore(filePath).get("1")!;
+      expect(task.blockedBy).toEqual([]);
+      expect(task.blocks).toEqual([]);
+      expect(task.metadata).toEqual({});
+      expect(task.createdAt).toEqual(expect.any(Number));
+      expect(task.updatedAt).toEqual(expect.any(Number));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the backing directory only on the first write", () => {
+    const dir = join(tmpdir(), `pi-tasks-lazy-${Date.now()}`);
+    const filePath = join(dir, "tasks.json");
+    try {
+      const store = new TaskStore(filePath);
+      expect(existsSync(dir)).toBe(false);
+
+      store.create("Task", "Desc");
+      expect(existsSync(filePath)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("TaskStore malformed files", () => {
+  let dir: string;
+  let filePath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-tasks-malformed-"));
+    filePath = join(dir, "tasks.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("continues IDs after the highest task when nextId is missing", () => {
+    writeFileSync(filePath, JSON.stringify({
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "completed" },
+        { id: "7", subject: "Seven", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(filePath).create("Next", "d").id).toBe("8");
+  });
+
+  it("does not reissue an existing ID", () => {
+    writeFileSync(filePath, JSON.stringify({
+      nextId: 2,
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "pending" },
+        { id: "5", subject: "Five", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(filePath).create("Next", "d").id).toBe("6");
+  });
+
+  it("keeps live state when the file has no tasks array", () => {
+    const store = new TaskStore(filePath);
+    store.create("Keep me", "d");
+    writeFileSync(filePath, JSON.stringify({ nextId: 5 }));
+
+    expect(store.list().map(task => task.subject)).toEqual(["Keep me"]);
+  });
+
+  it("skips entries that are not task records", () => {
+    writeFileSync(filePath, JSON.stringify({
+      nextId: 3,
+      tasks: [null, 5, "nope", { subject: "no id" }, { id: "2", subject: "Real", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(filePath).list().map(task => task.subject)).toEqual(["Real"]);
+  });
+
+  it("respects a valid nextId", () => {
+    writeFileSync(filePath, JSON.stringify({
+      nextId: 42,
+      tasks: [{ id: "1", subject: "One", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(filePath).create("Next", "d").id).toBe("42");
   });
 });

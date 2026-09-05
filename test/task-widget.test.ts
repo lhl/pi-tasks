@@ -111,6 +111,20 @@ describe("TaskWidget", () => {
     expect(lines[1]).not.toContain("◼");
   });
 
+  it("advances the spinner only on its timer", () => {
+    store.create("Running thing", "Desc", "Processing data");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+
+    expect(renderWidget(ui.state)[1]).toContain("✳");
+    widget.update();
+    widget.update();
+    expect(renderWidget(ui.state)[1]).toContain("✳");
+
+    vi.advanceTimersByTime(150);
+    expect(renderWidget(ui.state)[1]).toContain("✴");
+  });
+
   it("shows blocked-by info for pending tasks", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");
@@ -132,6 +146,17 @@ describe("TaskWidget", () => {
     const lines = renderWidget(ui.state);
     const blockedLine = lines.find(l => l.includes("Blocked"));
     expect(blockedLine).not.toContain("blocked by");
+  });
+
+  it("does not throw when a task is missing legacy fields", () => {
+    store.create("Legacy pending", "Desc");
+    const raw = store.get("1") as any;
+    delete raw.blockedBy;
+    delete raw.blocks;
+    delete raw.metadata;
+    widget.update();
+
+    expect(() => renderWidget(ui.state)).not.toThrow();
   });
 
   it("shows status summary in header", () => {

@@ -8,7 +8,7 @@ A [pi](https://pi.dev) extension for structured task tracking and coordination. 
 >
 > The fork diverged from upstream `0.5.0` and has since changed a fair amount — see the [`0.6.0` CHANGELOG entry](./CHANGELOG.md) for the full list. Highlights:
 >
-> - `TaskExecute` no longer spawns subagents via `@tintinweb/pi-subagents`; it queues follow-up user prompts in the current pi session instead. The whole subagent RPC layer is removed.
+> - `TaskExecute` no longer spawns subagents via `@tintinweb/pi-subagents`; it schedules sequential follow-up work in the current pi session instead. The whole subagent RPC layer is removed.
 > - New **interactive auto-advance mode** (`/tasks auto`, `autoMode: "auto"`) walks the task list to completion and asks the user about anything still in progress instead of silently retrying.
 > - `TaskCreateMany`, persisted task execution stats (start/end/duration/tokens), and a hardened task store (corrupt-file callback, dir auto-heal, `notFound` results).
 > - No more `<system-reminder>` injection into unrelated tool results.
@@ -20,8 +20,9 @@ A [pi](https://pi.dev) extension for structured task tracking and coordination. 
 
 - **8 LLM-callable tools** — `TaskCreate`, `TaskCreateMany`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute`.
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers, strikethrough for completed tasks, and a star spinner for active tasks with elapsed time and token counts.
-- **Prompt-injected task execution** — `TaskExecute` queues follow-up user prompts in the current pi session instead of launching subagents.
-- **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`). `cascade` silently queues the next open unblocked task. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
+- **Prompt-injected task execution** — `TaskExecute` schedules tasks in order and releases one follow-up prompt after each agent run. Completed, deleted, and blocked tasks are skipped before enqueueing.
+- **Compact continuation display** — generated task prompts render as a one-line task label in Pi 0.84 or newer; the full prompt remains in model context.
+- **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`). `cascade` selects the next open unblocked task after the agent run ends. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
 - **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references.
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for coordination.
 - **File locking** — concurrent access is safe when multiple sessions share a task list.
@@ -150,23 +151,23 @@ Stop a running background process associated with a task. Prompt-queued tasks ru
 
 ### `TaskExecute`
 
-Queue one or more tasks as follow-up user prompts in the current pi session.
+Schedule one or more tasks for sequential follow-up work in the current pi session.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `task_ids` | string[] | Task IDs to queue (required) |
+| `task_ids` | string[] | Ordered task IDs to schedule (required) |
 | `additional_context` | string | Extra context appended to each task prompt |
 
-Tasks must be `pending` or `in_progress`, and all `blockedBy` dependencies must be `completed`. `TaskExecute` marks pending tasks `in_progress`, displays the active spinner, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })` with a task-focused prompt.
+Tasks must be `pending` or `in_progress`, and all `blockedBy` dependencies must be `completed` when scheduled. The extension waits for the active agent run to end, checks each task again, and releases one live task prompt. A later task waits until the active explicit task is completed, deleted, or blocked. Tasks that reach one of those states before release do not trigger a model turn.
 
-Queued prompts instruct the agent to focus on that task, use `TaskGet` if needed, mark it `in_progress`, and mark it `completed` with an optional `metadata.result` summary when done. Dependent task prompts include completed prerequisites' `metadata.result` values when available.
+A released prompt marks a pending task `in_progress`, displays the active spinner, and instructs the agent to focus on that task, use `TaskGet` if needed, and finish with `TaskUpdate`. Dependent task prompts include completed prerequisites' `metadata.result` values when available.
 
 **Auto-advance** (`/tasks` → Settings, or `/tasks auto`) drives the task list forward automatically:
 
 | Mode | Behavior |
 |------|----------|
 | `off` (default) | Never auto-queues prompts — use `TaskExecute` or manual prompts. |
-| `cascade` | After each task completion or agent idle, silently queues the next open unblocked task. Capped to a few attempts per task to prevent runaway loops. |
+| `cascade` | At each agent-run boundary, queues the next open unblocked task from live task state. Capped to a few attempts per task to prevent runaway loops. |
 | `auto` | Same as cascade, but when a task is still `in_progress` at agent idle, asks you whether to **mark complete**, **continue** (re-queue), or **stop** auto mode. Auto-disables once every task is completed or cleared. |
 
 Dependent task prompts include completed prerequisites' `metadata.result` values when available.
@@ -205,8 +206,8 @@ Settings (`taskScope`, `autoMode`, `autoClearCompleted`) are saved to `<cwd>/.pi
 | Mode | Behaviour |
 |------|-----------|
 | `never` | Completed tasks stay visible until manually cleared |
-| `on_list_complete` **(default)** | Cleared after all tasks are done and a few idle turns pass |
-| `on_task_complete` | Each completed task cleared individually after a few turns |
+| `on_list_complete` **(default)** | Clears after four later turns, or before the first task in a later settled batch |
+| `on_task_complete` | Each completed task clears after four later turns; a fully completed list also retires before a later settled batch |
 
 ### Override via environment variables
 
@@ -278,8 +279,10 @@ src/
 
 ```bash
 npm install
+npm run lint
 npm run typecheck
 npm test
+npm run build
 ```
 
 ## License

@@ -271,6 +271,63 @@ describe("auto-clear: store getter (session switch)", () => {
   });
 });
 
+describe("auto-clear: run boundaries", () => {
+  it("retires a completed list before a later run creates work", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+
+    store.create("Finished", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+    manager.onRunEnded();
+    manager.startNewBatch();
+    const next = store.create("Fresh", "Desc");
+
+    expect(store.list().map(task => task.subject)).toEqual(["Fresh"]);
+    expect(next.id).toBe("2");
+  });
+
+  it("keeps completed work while the same run builds more tasks", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+
+    store.create("Finished", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+    manager.startNewBatch();
+    store.create("Same run", "Desc");
+
+    expect(store.list().map(task => task.subject)).toEqual(["Finished", "Same run"]);
+  });
+
+  it("keeps unfinished lists after a run boundary", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+
+    store.create("Finished", "Desc");
+    store.create("Open", "Desc");
+    store.update("1", { status: "completed" });
+    manager.onRunEnded();
+    manager.startNewBatch();
+    store.create("More", "Desc");
+
+    expect(store.list().map(task => task.subject)).toEqual(["Finished", "Open", "More"]);
+  });
+
+  it("keeps completed lists when automatic clearing is disabled", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "never");
+
+    store.create("Finished", "Desc");
+    store.update("1", { status: "completed" });
+    manager.onRunEnded();
+    manager.startNewBatch();
+    store.create("Fresh", "Desc");
+
+    expect(store.list().map(task => task.subject)).toEqual(["Finished", "Fresh"]);
+  });
+});
+
 describe("auto-clear: reset (new session)", () => {
   it("reset clears per-task tracking so old completions don't fire", () => {
     const store = new TaskStore();
