@@ -251,10 +251,12 @@ Flip auto-advance on or off without opening the menu:
 
 | Command | Effect |
 |---------|--------|
-| `/tasks auto` | Set mode to `auto` and immediately advance — will ask you about any in-progress task. |
+| `/tasks auto` | Set mode to `auto`; advance immediately only when the agent is idle. |
 | `/tasks auto cascade` | Set mode to `cascade` (silent auto-advance with attempt cap). |
 | `/tasks auto off` | Disable auto-advance. |
 | `/tasks auto status` | Show the current mode. |
+
+While the agent is working, `/tasks auto`, `/tasks auto on`, `/tasks auto cascade`, and **Start auto mode** only save the setting. They do not show a notification or task-action dialog, send a model message, or re-queue the running task. Auto-advance waits until the agent run ends and checks the task list then.
 
 In `auto` mode the extension prompts you at each agent idle with three choices:
 

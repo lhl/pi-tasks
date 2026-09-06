@@ -1255,6 +1255,10 @@ ${results.join("\n")}`);
           return;
         }
 
+        // Enabling during active work only changes the setting. The agent_end
+        // handler advances from live task state after the current run finishes.
+        if (!ctx.isIdle()) return;
+
         ui.notify(
           newMode === "auto"
             ? "Auto mode on — will advance through open tasks and ask you about anything still in progress."
@@ -1303,6 +1307,7 @@ ${results.join("\n")}`);
           await settingsMenu();
         } else if (choice === "Start auto mode") {
           setAutoMode("auto");
+          if (!ctx.isIdle()) return;
           ui.notify(
             "Auto mode on — will advance through open tasks and ask you about anything still in progress.",
             "info",

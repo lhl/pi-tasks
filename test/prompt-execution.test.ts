@@ -13,8 +13,10 @@ function mockCtx(overrides: {
   select?: (...args: any[]) => any;
   sessionManager?: { getSessionId: () => string; getSessionFile?: () => string | undefined };
   cwd?: string;
+  isIdle?: () => boolean;
 } = {}) {
   return {
+    isIdle: overrides.isIdle ?? (() => true),
     cwd: overrides.cwd ?? process.cwd(),
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
@@ -664,6 +666,45 @@ describe("/tasks auto command", () => {
     // Task is pending, no in_progress task, so a follow-up should be queued immediately.
     expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
     expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+  });
+
+  it.each([
+    ["auto", "auto"],
+    ["auto on", "auto"],
+    ["auto cascade", "cascade"],
+    ["menu", "auto"],
+  ])("%s silently enables queueing during active work", async (command, mode) => {
+    await writeConfig({ autoMode: "off" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    let idle = false;
+    const ctx = mockCtx({
+      isIdle: () => idle,
+      select: async () => "Start auto mode",
+    });
+    await mock.executeTool("TaskCreate", { subject: "Running", description: "Finish this" }, ctx);
+    await mock.executeTool("TaskCreate", { subject: "Next", description: "Then this" }, ctx);
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" }, ctx);
+    await mock.fireLifecycle("agent_start", {}, ctx);
+    ctx.ui.notify.mockClear();
+
+    await mock.commands.get("tasks")!.handler(command === "menu" ? "" : command, ctx);
+
+    expect((await readConfig()).autoMode).toBe(mode);
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(ctx.ui.select).toHaveBeenCalledTimes(command === "menu" ? 1 : 0);
+    const active = await mock.executeTool("TaskGet", { taskId: "1" }, ctx);
+    expect(active.content[0].text).toContain("Status: in_progress");
+
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" }, ctx);
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    idle = true;
+    await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+    expect(ctx.ui.select).toHaveBeenCalledTimes(command === "menu" ? 1 : 0);
+    await mock.fireLifecycle("session_shutdown", { reason: "quit" }, ctx);
   });
 
   it("/tasks auto off disables auto mode and clears the legacy flag", async () => {
