@@ -818,3 +818,86 @@ describe("/tasks auto command", () => {
     }
   });
 });
+
+describe("Run order visibility", () => {
+  afterEach(async () => {
+    await removeConfig();
+  });
+
+  const text = (result: any) => result.content[0].text as string;
+
+  async function threeTasks() {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreateMany", {
+      tasks: [
+        { subject: "Step one", description: "d" },
+        { subject: "Step two", description: "d" },
+        { subject: "Step three", description: "d" },
+      ],
+    });
+    return mock;
+  }
+
+  it("lists open tasks in run order rather than by ID", async () => {
+    const mock = await threeTasks();
+    await mock.executeTool("TaskReorder", { taskId: "3", before: "1" });
+    const listed = text(await mock.executeTool("TaskList", {}));
+    const ids = listed.split("\n").filter(line => line.startsWith("#")).map(line => line.slice(1, 2));
+    // Listing by ID here would contradict the reorder that just happened.
+    expect(ids).toEqual(["3", "1", "2"]);
+    expect(listed).toContain("#3 [pending] Step three  <- next");
+    expect(listed).toContain("Use TaskReorder to change what comes next");
+  });
+
+  it("states that work already in progress is taken before the run order", async () => {
+    const mock = await threeTasks();
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+    const moved = text(await mock.executeTool("TaskReorder", { taskId: "3", before: "1" }));
+    // The move is real but does not preempt, and says so at the point of the move.
+    expect(moved).toContain("Run order: #3 → #1 → #2");
+    expect(moved).toContain("#1 still runs next: it is already in progress");
+
+    const listed = text(await mock.executeTool("TaskList", {}));
+    expect(listed).toContain("#1 [in_progress] Step one  <- next");
+    expect(listed).toContain("Work in progress is taken before any pending task");
+  });
+
+  it("skips a blocked task rather than waiting for it, and says which runs instead", async () => {
+    const mock = await threeTasks();
+    await mock.executeTool("TaskUpdate", { taskId: "3", addBlockedBy: ["2"] });
+    const moved = text(await mock.executeTool("TaskReorder", { taskId: "3", before: "1" }));
+    expect(moved).toContain("#1 runs next: #3 is blocked and will be skipped");
+
+    const listed = text(await mock.executeTool("TaskList", {}));
+    expect(listed).toContain("[blocked by #2]");
+    expect(listed).toContain("#1 [pending] Step one  <- next");
+  });
+
+  it("reports when every open task is blocked", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Blocker", description: "d" });
+    await mock.executeTool("TaskCreate", { subject: "Blocked", description: "d" });
+    await mock.executeTool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
+    // Completing the blocker is what releases the blocked task.
+    expect(text(await mock.executeTool("TaskList", {}))).toContain("#1 [pending] Blocker  <- next");
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    expect(text(await mock.executeTool("TaskList", {}))).toContain("#2 [pending] Blocked  <- next");
+
+    // A mutual dependency deadlocks the list, which is worth stating rather than
+    // silently advancing nothing at every run boundary.
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "pending" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", addBlockedBy: ["2"] });
+    const listed = text(await mock.executeTool("TaskList", {}));
+    expect(listed).toContain("Nothing can run: every open task is blocked");
+    expect(listed).not.toContain("<- next");
+  });
+
+  it("reports a task's own position in the run order", async () => {
+    const mock = await threeTasks();
+    await mock.executeTool("TaskReorder", { taskId: "3", before: "1" });
+    expect(text(await mock.executeTool("TaskGet", { taskId: "3" }))).toContain("Run order: 1 of 3 open");
+    expect(text(await mock.executeTool("TaskGet", { taskId: "2" }))).toContain("Run order: 3 of 3 open");
+  });
+});

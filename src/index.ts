@@ -772,7 +772,7 @@ Returns a summary of each task:
 - **subject**: Brief description of the task
 - **status**: 'pending', 'in_progress', or 'completed'
 - **owner**: Agent ID if assigned, empty if available
-- **blockedBy**: List of open task IDs that must be resolved first (tasks with blockedBy cannot be claimed until dependencies resolve)
+- **blockedBy**: List of open task IDs that must be resolved first (tasks with blockedBy cannot be claimed until dependencies resolve). A blocked task is skipped by auto-advance, not waited for: the next unblocked task in run order runs instead.
 
 Use TaskGet with a specific task ID to view full details including description and comments.`,
     parameters: Type.Object({}),
@@ -781,13 +781,14 @@ Use TaskGet with a specific task ID to view full details including description a
       const tasks = store.list();
       if (tasks.length === 0) return Promise.resolve(textResult("No tasks found"));
 
-      // Sort: pending first (by ID), then in_progress (by ID), then completed (by ID)
-      const statusOrder: Record<string, number> = { pending: 0, in_progress: 1, completed: 2 };
-      const sorted = [...tasks].sort((a, b) => {
-        const so = (statusOrder[a.status] ?? 0) - (statusOrder[b.status] ?? 0);
-        if (so !== 0) return so;
-        return Number(a.id) - Number(b.id);
-      });
+      // Open tasks read in run order, which is the order they will actually be worked
+      // in; finished tasks carry no position and follow. Listing open tasks by ID here
+      // would contradict TaskReorder, which is the one thing that sets this order.
+      const sorted = [
+        ...tasks.filter(task => task.status !== "completed"),
+        ...tasks.filter(task => task.status === "completed"),
+      ];
+      const next = findNextOpenTask();
 
       const lines = sorted.map(task => {
         let line = `#${task.id} [${task.status}] ${task.subject}`;
@@ -797,18 +798,28 @@ Use TaskGet with a specific task ID to view full details including description a
         }
 
         // Only show non-completed blockers
-        if (task.blockedBy.length > 0) {
-          const openBlockers = task.blockedBy.filter(bid => {
-            const blocker = store.get(bid);
-            return blocker && blocker.status !== "completed";
-          });
-          if (openBlockers.length > 0) {
-            line += ` [blocked by ${openBlockers.map(id => "#" + id).join(", ")}]`;
-          }
+        const openBlockers = getOpenBlockers(task);
+        if (openBlockers.length > 0) {
+          line += ` [blocked by ${openBlockers.map(id => "#" + id).join(", ")}]`;
         }
+        if (next && task.id === next.id) line += "  <- next";
 
         return line;
       });
+      if (next) {
+        // State the selection rather than making the reader infer it: an in_progress task
+        // is taken before any pending one whatever the order says, and a blocked task is
+        // skipped rather than waited for.
+        lines.push("");
+        lines.push(
+          next.status === "in_progress"
+            ? `Next: #${next.id}, already in progress. Work in progress is taken before any pending task, whatever the run order says.`
+            : `Next: #${next.id}, the first unblocked task in run order. Use TaskReorder to change what comes next.`,
+        );
+      } else if (sorted.some(task => task.status !== "completed")) {
+        lines.push("");
+        lines.push("Nothing can run: every open task is blocked. Complete a blocker, or drop the dependency with TaskUpdate.");
+      }
 
       return Promise.resolve(textResult(lines.join("\n")));
     },
@@ -873,6 +884,11 @@ Returns full task details:
       }
       if (task.blocks.length > 0) {
         lines.push(`Blocks: ${task.blocks.map(id => "#" + id).join(", ")}`);
+      }
+      if (task.status !== "completed") {
+        const open = store.list().filter(item => item.status !== "completed");
+        const position = open.findIndex(item => item.id === task.id);
+        if (position >= 0) lines.push(`Run order: ${position + 1} of ${open.length} open`);
       }
 
       const executionStats = isTaskExecutionStats(task.metadata.executionStats)
@@ -1066,9 +1082,20 @@ Tasks run in list order, so the order decides what is worked on next. Reorder wh
 ## When NOT to Use This Tool
 
 - **One task genuinely cannot start until another finishes.** Use \`TaskUpdate\` with
-  \`addBlockedBy\` instead. A dependency is enforced; an order is only a preference,
-  and auto-advance will skip a blocked task regardless of where it sits.
+  \`addBlockedBy\` instead. A dependency is enforced; an order is only a preference.
 - To mark what you are working on now — use \`TaskUpdate\` with \`in_progress\`.
+
+## What decides the next task
+
+Run order is the last tie-breaker, not the first rule. In order of precedence:
+
+1. **A task already \`in_progress\` runs next**, whatever the order says. Moving a pending
+   task to the front will not preempt work already started.
+2. **Blocked tasks are skipped**, not waited for. A task with an open \`blockedBy\` entry is
+   passed over and the next unblocked task runs instead, wherever its blocker sits.
+3. **Among the rest, the first in run order wins.** That is what this tool changes.
+
+\`TaskList\` marks the task that runs next and says why, so read it rather than deriving it.
 
 ## Examples
 
@@ -1100,8 +1127,20 @@ Move task 1 to sit right after task 4:
         );
       }
       widget.update();
-      const order = moved.map((task) => `#${task.id}`).join(" → ");
-      return Promise.resolve(textResult(`Moved task #${taskId}. Run order: ${order}`));
+      const order = moved.filter((task) => task.status !== "completed").map((task) => `#${task.id}`).join(" → ");
+      const next = findNextOpenTask();
+      // Say what this actually changed. A move cannot preempt work already in progress,
+      // and cannot promote a blocked task, so report the real next task either way.
+      const outcome = !next
+        ? "Nothing can run: every open task is blocked."
+        : next.id === taskId
+          ? `#${taskId} runs next.`
+          : next.status === "in_progress"
+            ? `#${next.id} still runs next: it is already in progress, which is taken before any pending task.`
+            : getOpenBlockers(store.get(taskId) ?? { blockedBy: [] }).length > 0
+              ? `#${next.id} runs next: #${taskId} is blocked and will be skipped until its blockers complete.`
+              : `#${next.id} runs next.`;
+      return Promise.resolve(textResult(`Moved task #${taskId}. Run order: ${order}\n${outcome}`));
     },
   });
 

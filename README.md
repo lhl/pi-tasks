@@ -109,7 +109,8 @@ List all tasks with status, owner, and blocked-by info.
 #3 [pending] Update docs [blocked by #1, #2]
 ```
 
-Sort order: pending first, then in-progress, then completed (each group by ID).
+Open tasks list in run order and the next one is marked `<- next`, with a line saying why it was
+chosen. Completed tasks follow. Blocked tasks show `[blocked by #N]`.
 
 ### `TaskGet`
 
@@ -147,8 +148,18 @@ that order, so this decides what is worked on next.
 | `after` | string | Move it to sit immediately after this task ID |
 
 Give exactly one of `before` or `after`. Positions are renumbered densely from 1 after every move.
-Use `TaskUpdate` with `addBlockedBy` instead when one task truly cannot start until another
-finishes: a dependency is enforced, an order is only a preference.
+The result reports which task actually runs next, which is not always the one that moved.
+
+Run order is the last tie-breaker, not the first rule. What runs next is decided in this order:
+
+1. A task already `in_progress` runs next, whatever the run order says. Moving a pending task to the
+   front does not preempt work already started.
+2. Blocked tasks are skipped, not waited for. A task with an open `blockedBy` entry is passed over
+   and the next unblocked task runs instead, wherever its blocker sits in the order.
+3. Among the rest, the first in run order wins. That is what `TaskReorder` changes.
+
+Use `TaskUpdate` with `addBlockedBy` when one task truly cannot start until another finishes: a
+dependency is enforced, an order is only a preference.
 
 ### `TaskOutput`
 
