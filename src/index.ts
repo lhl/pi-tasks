@@ -74,7 +74,14 @@ function formatClockTime(ms: number): string {
 /** How many turns completed tasks linger before auto-clearing. */
 const AUTO_CLEAR_DELAY = 4;
 
-/** Maximum autonomous prompt injections for the same unfinished task. */
+/**
+ * Maximum autonomous prompt injections for the same task without observable progress.
+ *
+ * This bounds a stuck task, not the run length: the counter resets whenever the task
+ * changes, so a list advances for as long as work is actually happening. Pacing the
+ * sends is a separate concern the host owns, and under Jouzu session flow control it
+ * already holds each one until the session is genuinely idle.
+ */
 const AUTO_CONTINUE_MAX_ATTEMPTS = 3;
 
 export default function (pi: ExtensionAPI) {
@@ -138,8 +145,11 @@ export default function (pi: ExtensionAPI) {
   const scheduledTaskPrompts: Array<{ taskId: string; additionalContext?: string }> = [];
   /** Explicit task whose prompt was released and has not reached a terminal state. */
   let activeScheduledTaskId: string | undefined;
-  /** Guardrail to prevent runaway auto-continue loops on the same unfinished task. */
-  const autoPromptAttempts = new Map<string, number>();
+  /**
+   * Consecutive auto-continue attempts per task, with the `updatedAt` each was counted
+   * against. A task that changes between attempts has made progress and starts over.
+   */
+  const autoPromptAttempts = new Map<string, { count: number; seenUpdatedAt: number }>();
   /** Re-entrancy guard for the interactive auto-mode prompt. */
   let autoAskInFlight = false;
 
@@ -234,12 +244,12 @@ export default function (pi: ExtensionAPI) {
       return { queued: false, message: `#${current.id}: prompt already queued` };
     }
 
-    if (!options.explicit) {
-      const attempts = autoPromptAttempts.get(current.id) ?? 0;
-      if (attempts >= AUTO_CONTINUE_MAX_ATTEMPTS) {
-        return { queued: false, message: `#${current.id}: auto-continue limit reached` };
-      }
-      autoPromptAttempts.set(current.id, attempts + 1);
+    // Progress since the last attempt clears the count: only a task that has not
+    // moved at all is looping, and a long task that keeps changing is not.
+    const prior = options.explicit ? undefined : autoPromptAttempts.get(current.id);
+    const attempts = prior && prior.seenUpdatedAt === current.updatedAt ? prior.count : 0;
+    if (!options.explicit && attempts >= AUTO_CONTINUE_MAX_ATTEMPTS) {
+      return { queued: false, message: `#${current.id}: no progress after ${attempts} attempts` };
     }
 
     const previousStatus = current.status;
@@ -263,6 +273,13 @@ export default function (pi: ExtensionAPI) {
     queuedTaskIds.add(current.id);
     widget.setActiveTask(current.id);
     widget.update();
+    // Stamp the task as it stands once queueing is finished. Queueing writes to it
+    // twice — marking it in_progress, and the widget persisting its start metrics —
+    // and neither is work on the task, so neither may buy it another attempt.
+    if (!options.explicit) {
+      const queued = store.get(current.id) ?? queuedTask;
+      autoPromptAttempts.set(current.id, { count: attempts + 1, seenUpdatedAt: queued.updatedAt });
+    }
     debug("queued task prompt", { taskId: current.id, reason: options.reason });
     return { queued: true, message: `#${current.id} → queued follow-up prompt` };
   }
@@ -798,7 +815,7 @@ Use TaskGet with a specific task ID to view full details including description a
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 3: TaskGet
+  // Tool 4: TaskGet
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -892,7 +909,7 @@ Returns full task details:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 4: TaskUpdate
+  // Tool 5: TaskUpdate
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -1030,7 +1047,66 @@ Set up task dependencies:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 5: TaskOutput
+  // Tool 6: TaskReorder
+  // ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "TaskReorder",
+    label: "TaskReorder",
+    description: `Use this tool to move a task to a different position in the run order.
+
+## When to Use This Tool
+
+Tasks run in list order, so the order decides what is worked on next. Reorder when:
+
+- You discover that one task should be done before another already on the list
+- A task turns out to be a prerequisite, but does not strictly block the other
+- You created tasks in the order you thought of them, not the order to do them
+
+## When NOT to Use This Tool
+
+- **One task genuinely cannot start until another finishes.** Use \`TaskUpdate\` with
+  \`addBlockedBy\` instead. A dependency is enforced; an order is only a preference,
+  and auto-advance will skip a blocked task regardless of where it sits.
+- To mark what you are working on now — use \`TaskUpdate\` with \`in_progress\`.
+
+## Examples
+
+Do task 5 before task 2:
+\`\`\`json
+{"taskId": "5", "before": "2"}
+\`\`\`
+
+Move task 1 to sit right after task 4:
+\`\`\`json
+{"taskId": "1", "after": "4"}
+\`\`\``,
+    parameters: Type.Object({
+      taskId: Type.String({ description: "The ID of the task to move" }),
+      before: Type.Optional(Type.String({ description: "Move the task to sit immediately before this task ID" })),
+      after: Type.Optional(Type.String({ description: "Move the task to sit immediately after this task ID" })),
+    }),
+
+    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const { taskId, before, after } = params;
+      if ((before === undefined) === (after === undefined)) {
+        return Promise.resolve(textResult("Specify exactly one of before or after"));
+      }
+      const moved = store.reorder(taskId, { before, after });
+      if (!Array.isArray(moved)) {
+        const missing = moved.notFound;
+        return Promise.resolve(
+          textResult(missing === taskId ? `Task #${taskId} not found` : `Task #${missing} not found`),
+        );
+      }
+      widget.update();
+      const order = moved.map((task) => `#${task.id}`).join(" → ");
+      return Promise.resolve(textResult(`Moved task #${taskId}. Run order: ${order}`));
+    },
+  });
+
+  // ──────────────────────────────────────────────────
+  // Tool 7: TaskOutput
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -1084,7 +1160,7 @@ ${String(task.metadata.result)}` : "";
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 6: TaskStop
+  // Tool 8: TaskStop
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -1126,7 +1202,7 @@ ${String(task.metadata.result)}` : "";
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 7: TaskExecute
+  // Tool 9: TaskExecute
   // ──────────────────────────────────────────────────
 
   pi.registerTool({

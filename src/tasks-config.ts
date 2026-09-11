@@ -15,10 +15,11 @@ export interface TasksConfig {
    */
   autoCascade?: boolean;
   /**
-   * Auto-advance behavior. Default: "off".
+   * Auto-advance behavior. Default: "cascade".
    * - "off"     — never auto-queue follow-up prompts.
    * - "cascade" — silently queue the next open unblocked task after completion
-   *               or agent idle. Capped per task to prevent runaway loops.
+   *               or agent idle, so a list runs to its end unless interrupted.
+   *               A task that stops changing is dropped after a few attempts.
    * - "auto"    — like cascade, but when an in_progress task is still open at
    *               agent idle, ask the user (complete / continue / stop) instead
    *               of silently retrying. Auto-disables when everything is done.
@@ -64,9 +65,14 @@ export function saveTasksConfig(config: TasksConfig, cwd: string, agentDir = get
 /**
  * Resolve the effective auto-advance mode, honoring the legacy
  * `autoCascade` boolean for configs written by older versions.
+ *
+ * A task list exists to be worked through, so an unconfigured session cascades:
+ * stopping at every task boundary made the user restart the list by hand. Anyone
+ * who wants the old behavior sets `autoMode: "off"`, and `autoCascade: false`
+ * from an older config is still read as that explicit choice.
  */
 export function getAutoMode(config: TasksConfig): AutoMode {
   if (config.autoMode) return config.autoMode;
-  if (config.autoCascade === true) return "cascade";
-  return "off";
+  if (config.autoCascade === false) return "off";
+  return "cascade";
 }

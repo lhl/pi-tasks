@@ -18,11 +18,12 @@ A [pi](https://pi.dev) extension for structured task tracking and coordination. 
 
 ## Features
 
-- **8 LLM-callable tools** — `TaskCreate`, `TaskCreateMany`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute`.
+- **9 LLM-callable tools** — `TaskCreate`, `TaskCreateMany`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskReorder`, `TaskOutput`, `TaskStop`, `TaskExecute`.
 - **Persistent widget** — live task list above the editor with status icons, task numbers, active-run time and tokens, a configurable row limit, and optional completed-task collapse.
 - **Prompt-injected task execution** — `TaskExecute` schedules tasks in order and releases one follow-up prompt after each agent run. Completed, deleted, and blocked tasks are skipped before enqueueing.
 - **Compact continuation display** — generated task prompts render as a one-line task label in Pi 0.84 or newer; the full prompt remains in model context.
-- **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`). `cascade` selects the next open unblocked task after the agent run ends. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
+- **Auto-advance mode** — tri-state setting (`off` / `cascade` / `auto`), defaulting to `cascade`. `cascade` selects the next open unblocked task after the agent run ends, so a list runs to its end unless you interrupt it. `auto` does the same, but when an in-progress task is still open at agent idle it asks you whether to mark it complete, continue, or stop. Toggle from the command line with `/tasks auto`.
+- **Run order** — tasks run in list order, and `TaskReorder` moves one task before or after another. Order is a preference; use `blockedBy` when one task genuinely cannot start until another finishes.
 - **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references.
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for coordination.
 - **File locking** — concurrent access is safe when multiple sessions share a task list.
@@ -134,6 +135,21 @@ Setting `status: "deleted"` permanently removes the task.
 
 Dependencies are bidirectional: `addBlocks: ["3"]` on task 1 also adds `blockedBy: ["1"]` to task 3.
 
+### `TaskReorder`
+
+Move a task to a different position in the run order. Auto-advance takes the first unblocked task in
+that order, so this decides what is worked on next.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `taskId` | string | Task ID to move (required) |
+| `before` | string | Move it to sit immediately before this task ID |
+| `after` | string | Move it to sit immediately after this task ID |
+
+Give exactly one of `before` or `after`. Positions are renumbered densely from 1 after every move.
+Use `TaskUpdate` with `addBlockedBy` instead when one task truly cannot start until another
+finishes: a dependency is enforced, an order is only a preference.
+
 ### `TaskOutput`
 
 Retrieve output from a background task process, or report the status of a prompt-queued task.
@@ -167,8 +183,8 @@ A released prompt marks a pending task `in_progress`, displays the active spinne
 
 | Mode | Behavior |
 |------|----------|
-| `off` (default) | Never auto-queues prompts — use `TaskExecute` or manual prompts. |
-| `cascade` | At each agent-run boundary, queues the next open unblocked task from live task state. Capped to a few attempts per task to prevent runaway loops. |
+| `off` | Never auto-queues prompts — use `TaskExecute` or manual prompts. |
+| `cascade` (default) | At each agent-run boundary, queues the next open unblocked task from live task state, so a list runs to its end unless interrupted. A task that stops changing between attempts is dropped after a few tries; a task that keeps changing keeps going. |
 | `auto` | Same as cascade, but when a task is still `in_progress` at agent idle, asks you whether to **mark complete**, **continue** (re-queue), or **stop** auto mode. Auto-disables once every task is completed or cleared. |
 
 Dependent task prompts include completed prerequisites' `metadata.result` values when available.
@@ -203,7 +219,7 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 
 Task and project-config paths follow the active session's workspace rather than the process launch directory. Under `session-global`, an existing workspace file for the same session remains in use, so changing the setting does not move or strand tasks.
 
-Global defaults are read from `<agent-dir>/tasks-config.json`. Project overrides are saved to `<workspace>/.pi/tasks-config.json` and take precedence key by key. Supported settings are `taskScope`, `autoMode`, `autoClearCompleted`, `collapseCompleted`, and `maxVisible`. The legacy `autoCascade: true` setting maps to `autoMode: "cascade"`.
+Global defaults are read from `<agent-dir>/tasks-config.json`. Project overrides are saved to `<workspace>/.pi/tasks-config.json` and take precedence key by key. Supported settings are `taskScope`, `autoMode`, `autoClearCompleted`, `collapseCompleted`, and `maxVisible`. The legacy `autoCascade` setting still applies: `true` maps to `autoMode: "cascade"`, and `false` to `autoMode: "off"`.
 
 ### Auto-clear completed tasks
 

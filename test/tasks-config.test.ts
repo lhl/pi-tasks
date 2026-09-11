@@ -106,4 +106,14 @@ describe("tasks config", () => {
     expect(getAutoMode({ autoCascade: true })).toBe("cascade");
     expect(getAutoMode({ autoCascade: true, autoMode: "off" })).toBe("off");
   });
+
+  it("cascades by default and honors an explicit opt out", () => {
+    // A task list exists to be worked through, so an unconfigured session advances.
+    expect(getAutoMode({})).toBe("cascade");
+    expect(getAutoMode({ maxVisible: 10 })).toBe("cascade");
+    expect(getAutoMode({ autoMode: "off" })).toBe("off");
+    // An older config that turned cascade off stays off rather than being re-enabled.
+    expect(getAutoMode({ autoCascade: false })).toBe("off");
+    expect(getAutoMode({ autoCascade: false, autoMode: "auto" })).toBe("auto");
+  });
 });

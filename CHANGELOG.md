@@ -12,12 +12,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `TaskReorder` moves a task before or after another in the run order. Auto-advance takes the first
+  unblocked task in that order, so reordering decides what is worked on next. Positions renumber
+  densely from 1 after every move. Use `blockedBy` when a task genuinely cannot start until another
+  finishes; an order is a preference, a dependency is enforced.
+- Tasks carry an `order` field. A store written before this field existed reads in its original ID
+  order, and a task created afterwards appends to the end.
 - Generated task-continuation prompts render as one-line task labels when the host supports display-only Markdown transformers. The model still receives the full task prompt.
 - Global defaults load from `<agent-dir>/tasks-config.json`; project settings remain per-key overrides.
 - The optional `session-global` scope keeps new per-session task files under Pi's agent directory instead of the workspace.
 - `collapseCompleted` and `maxVisible` settings bound the widget without changing model-visible task output.
 
 ### Changed
+- Auto-advance defaults to `cascade` rather than `off`, so a task list runs to its end unless
+  interrupted. `autoMode: "off"` restores the previous behavior, and a legacy `autoCascade: false`
+  config is read as that explicit choice.
+- The per-task auto-continue cap now counts only attempts without observable progress: the counter
+  resets whenever the task changes, so a long task keeps advancing while a stuck one still stops
+  after three tries. Writes caused by queueing itself do not count as progress.
+- `updatedAt` advances on every write even when two land in the same millisecond, so it is a
+  reliable answer to whether a task changed.
 - `TaskExecute` schedules ordered work and releases one live task prompt at each agent-run boundary. A later explicit task waits while the active task remains open.
 - Cascade advancement selects the next task after `agent_end` instead of during `TaskUpdate`, so the active run can finish more work before another prompt enters Pi's follow-up queue.
 - A completed list remains visible after its run and is retired before the first task created in a later batch.

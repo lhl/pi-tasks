@@ -619,3 +619,64 @@ describe("TaskStore malformed files", () => {
     expect(new TaskStore(filePath).create("Next", "d").id).toBe("42");
   });
 });
+
+describe("TaskStore run order", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = new TaskStore();
+  });
+
+  it("appends new tasks to the end of the order", () => {
+    const first = store.create("First", "");
+    const second = store.create("Second", "");
+    expect([first.order, second.order]).toEqual([1, 2]);
+    expect(store.list().map((task) => task.id)).toEqual(["1", "2"]);
+  });
+
+  it("moves a task before or after another and renumbers densely", () => {
+    for (const subject of ["A", "B", "C", "D"]) store.create(subject, "");
+    expect(store.reorder("4", { before: "2" })).not.toHaveProperty("notFound");
+    expect(store.list().map((task) => task.id)).toEqual(["1", "4", "2", "3"]);
+    // Dense from 1: there is no gap to exhaust and no fractional index to drift.
+    expect(store.list().map((task) => task.order)).toEqual([1, 2, 3, 4]);
+
+    store.reorder("1", { after: "3" });
+    expect(store.list().map((task) => task.id)).toEqual(["4", "2", "3", "1"]);
+    expect(store.list().map((task) => task.order)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("reports the missing side and changes nothing when either task is unknown", () => {
+    store.create("A", "");
+    store.create("B", "");
+    const before = store.list().map((task) => task.id);
+    expect(store.reorder("9", { before: "1" })).toEqual({ notFound: "9" });
+    expect(store.reorder("1", { before: "9" })).toEqual({ notFound: "9" });
+    // Moving a task relative to itself has no meaning and must not renumber.
+    expect(store.reorder("1", { before: "1" })).toEqual({ notFound: "1" });
+    expect(store.list().map((task) => task.id)).toEqual(before);
+  });
+
+  it("reads a store written before ordering existed in its original ID order", () => {
+    for (const subject of ["A", "B", "C"]) store.create(subject, "");
+    // Simulate tasks persisted by an older version: no order field at all.
+    for (const task of store.list()) delete task.order;
+    expect(store.list().map((task) => task.id)).toEqual(["1", "2", "3"]);
+    // A task created afterwards still lands at the end rather than colliding.
+    expect(store.create("D", "").order).toBe(4);
+    expect(store.list().map((task) => task.id)).toEqual(["1", "2", "3", "4"]);
+  });
+
+  it("marks only the moved task as updated", async () => {
+    for (const subject of ["A", "B", "C"]) store.create(subject, "");
+    const stamps = new Map(store.list().map((task) => [task.id, task.updatedAt]));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    store.reorder("3", { before: "1" });
+    const after = new Map(store.list().map((task) => [task.id, task.updatedAt]));
+    expect(after.get("3")).toBeGreaterThan(stamps.get("3") as number);
+    // Renumbering a neighbour is bookkeeping, not progress: the no-progress guard
+    // that watches updatedAt must not read a reorder as work on those tasks.
+    expect(after.get("1")).toBe(stamps.get("1"));
+    expect(after.get("2")).toBe(stamps.get("2"));
+  });
+});

@@ -41,6 +41,12 @@ export interface Task {
   metadata: Record<string, any> & { executionStats?: TaskExecutionStats };
   blocks: string[];
   blockedBy: string[];
+  /**
+   * Position in the run order, 1-based and dense. Auto-advance takes the first
+   * unblocked task in this order, so moving a task here changes what runs next.
+   * Absent on tasks written before ordering existed; those sort by ID.
+   */
+  order?: number;
   createdAt: number;
   updatedAt: number;
 }

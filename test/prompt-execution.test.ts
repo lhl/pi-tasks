@@ -353,7 +353,7 @@ describe("Auto-continue with prompts", () => {
     await removeConfig();
   });
 
-  it("does not auto-continue when disabled by default", async () => {
+  it("does not continue mid-run, and continues at the boundary by default", async () => {
     const mock = mockPi();
     initExtension(mock.pi as any);
 
@@ -361,8 +361,58 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskCreate", { subject: "B", description: "Desc" });
     await mock.executeTool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
 
+    // Completing a task never injects mid-run; the run boundary owns that.
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
     expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+
+    // With no configuration at all the list advances rather than stopping.
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+  });
+
+  it("stops advancing when auto mode is turned off", async () => {
+    await writeConfig({ autoMode: "off" });
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", { subject: "A", description: "Desc" });
+    await mock.executeTool("TaskCreate", { subject: "B", description: "Desc" });
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps advancing while the task changes, and gives up once it stops changing", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Long task", description: "Desc" });
+
+    const advance = async () => {
+      await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+      const calls = mock.pi.sendUserMessage.mock.calls;
+      const prompt = calls[calls.length - 1]?.[0] as string | undefined;
+      if (prompt) {
+        await mock.fireLifecycle("message_start", {
+          message: { role: "user", content: [{ type: "text", text: prompt }] },
+        }, mockCtx());
+      }
+      return calls.length;
+    };
+
+    // Work that keeps changing the task keeps being handed back, well past the
+    // old fixed cap of three: the guard bounds a stuck task, not a long one.
+    let sent = 0;
+    for (let round = 0; round < 6; round++) {
+      sent = await advance();
+      await mock.executeTool("TaskUpdate", { taskId: "1", metadata: { round } });
+    }
+    expect(sent).toBe(6);
+
+    // Once nothing about the task changes, it is dropped after the attempt budget.
+    const before = mock.pi.sendUserMessage.mock.calls.length;
+    for (let round = 0; round < 5; round++) await advance();
+    expect(mock.pi.sendUserMessage.mock.calls.length - before).toBe(3);
   });
 
   it("queues the next unblocked task after completion when enabled", async () => {

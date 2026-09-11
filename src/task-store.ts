@@ -15,6 +15,19 @@ const TASKS_DIR = join(homedir(), ".pi", "tasks");
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100; // 5s max
 
+/**
+ * A modification stamp that always moves forward.
+ *
+ * `updatedAt` doubles as the token callers compare to ask "did this task change?",
+ * and two updates inside the same millisecond would answer no. Clamping to one past
+ * the previous value keeps it an ordinary millisecond timestamp while making every
+ * write observable.
+ */
+function touch(previous: number | undefined): number {
+  const now = Date.now();
+  return previous !== undefined && previous >= now ? previous + 1 : now;
+}
+
 /** Acquire a file lock and return the unique token written into it. */
 function acquireLock(lockPath: string): string {
   ensureDir(lockPath);
@@ -193,6 +206,7 @@ export class TaskStore {
         metadata: metadata ?? {},
         blocks: [],
         blockedBy: [],
+        order: this.nextOrder(),
         createdAt: now,
         updatedAt: now,
       };
@@ -206,10 +220,53 @@ export class TaskStore {
     return this.tasks.get(id);
   }
 
-  /** List all tasks sorted by ID ascending. */
+  /**
+   * List all tasks in run order: by `order` ascending, then by ID. A task written
+   * before ordering existed has no `order` and falls back to its ID, which is the
+   * order such a store already had, so an unordered store reads exactly as before.
+   */
   list(): Task[] {
     if (this.filePath) this.load();
-    return Array.from(this.tasks.values()).sort((a, b) => Number(a.id) - Number(b.id));
+    return Array.from(this.tasks.values()).sort(
+      (a, b) => (a.order ?? Number(a.id)) - (b.order ?? Number(b.id)) || Number(a.id) - Number(b.id),
+    );
+  }
+
+  /** One past the last occupied position, so a new task appends rather than colliding. */
+  private nextOrder(): number {
+    let max = 0;
+    for (const task of this.tasks.values()) max = Math.max(max, task.order ?? Number(task.id));
+    return max + 1;
+  }
+
+  /**
+   * Move one task to sit immediately before or after another, and renumber every
+   * task densely from 1. Renumbering keeps positions predictable and total: there
+   * is no gap to exhaust and no fractional index to accumulate error.
+   */
+  reorder(id: string, target: { before?: string; after?: string }): Task[] | { notFound: string } {
+    return this.withLock(() => {
+      const moving = this.tasks.get(id);
+      if (!moving) return { notFound: id };
+      const anchorId = target.before ?? target.after;
+      if (anchorId === undefined) return { notFound: "" };
+      if (anchorId === id) return { notFound: id };
+      if (!this.tasks.has(anchorId)) return { notFound: anchorId };
+      const ordered = Array.from(this.tasks.values()).sort(
+        (a, b) => (a.order ?? Number(a.id)) - (b.order ?? Number(b.id)) || Number(a.id) - Number(b.id),
+      );
+      const rest = ordered.filter((task) => task.id !== id);
+      const at = rest.findIndex((task) => task.id === anchorId);
+      rest.splice(target.before !== undefined ? at : at + 1, 0, moving);
+      rest.forEach((task, index) => {
+        const position = index + 1;
+        if (task.order === position) return;
+        task.order = position;
+        // Only the moved task changed as work; renumbering a neighbour is bookkeeping.
+        if (task.id === id) task.updatedAt = touch(task.updatedAt);
+      });
+      return rest;
+    });
   }
 
   update(id: string, fields: {
@@ -282,7 +339,7 @@ export class TaskStore {
           const target = this.tasks.get(targetId);
           if (target && !target.blockedBy.includes(id)) {
             target.blockedBy.push(id);
-            target.updatedAt = Date.now();
+            target.updatedAt = touch(target.updatedAt);
           }
           // Warnings for problematic edges
           if (targetId === id) {
@@ -304,7 +361,7 @@ export class TaskStore {
           const target = this.tasks.get(targetId);
           if (target && !target.blocks.includes(id)) {
             target.blocks.push(id);
-            target.updatedAt = Date.now();
+            target.updatedAt = touch(target.updatedAt);
           }
           // Warnings for problematic edges
           if (targetId === id) {
@@ -318,7 +375,7 @@ export class TaskStore {
         changedFields.push("blockedBy");
       }
 
-      task.updatedAt = Date.now();
+      task.updatedAt = touch(task.updatedAt);
       return { task, changedFields, warnings, notFound: false };
     });
   }
