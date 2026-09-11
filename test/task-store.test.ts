@@ -680,3 +680,48 @@ describe("TaskStore run order", () => {
     expect(after.get("2")).toBe(stamps.get("2"));
   });
 });
+
+describe("TaskStore run order durability", () => {
+  let dir: string;
+  let filePath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-tasks-order-"));
+    filePath = join(dir, "tasks.json");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("keeps run order across a reload", () => {
+    const store = new TaskStore(filePath);
+    for (const subject of ["A", "B", "C"]) store.create(subject, "");
+    store.reorder("3", { before: "1" });
+    expect(new TaskStore(filePath).list().map((task) => task.id)).toEqual(["3", "1", "2"]);
+  });
+
+  it("assigns positions to bulk-created tasks too", () => {
+    const store = new TaskStore();
+    store.create("First", "");
+    const bulk = store.createMany([{ subject: "B", description: "" }, { subject: "C", description: "" }]);
+    // Relying on the ID fallback happens to sort correctly, but leaves records without
+    // the field, so a later reorder is the first thing that ever writes a position.
+    expect(bulk.map((task) => task.order)).toEqual([2, 3]);
+    expect(store.list().map((task) => task.id)).toEqual(["1", "2", "3"]);
+  });
+
+  it("ignores a stored order that is not a usable position", () => {
+    writeFileSync(filePath, JSON.stringify({
+      nextId: 4,
+      tasks: [
+        { id: "1", subject: "A", description: "", status: "pending", metadata: {}, blocks: [], blockedBy: [], order: "abc", createdAt: 1, updatedAt: 1 },
+        { id: "2", subject: "B", description: "", status: "pending", metadata: {}, blocks: [], blockedBy: [], order: Number.NaN, createdAt: 1, updatedAt: 1 },
+        { id: "3", subject: "C", description: "", status: "pending", metadata: {}, blocks: [], blockedBy: [], order: 0, createdAt: 1, updatedAt: 1 },
+      ],
+    }));
+    // A NaN comparator would scramble the list silently. The two bad values fall back to
+    // their IDs, and the one real position still sorts where it says.
+    expect(new TaskStore(filePath).list().map((task) => task.id)).toEqual(["3", "1", "2"]);
+    // The fallback is the ID, not the field: the unusable values are dropped, not kept.
+    const loaded = new TaskStore(filePath).list();
+    expect(loaded.map((task) => task.order)).toEqual([0, undefined, undefined]);
+  });
+});

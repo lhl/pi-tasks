@@ -87,6 +87,9 @@ function normalizeTask(task: Task): Task {
     blockedBy: Array.isArray(task.blockedBy) ? task.blockedBy : [],
     createdAt: typeof task.createdAt === "number" ? task.createdAt : now,
     updatedAt: typeof task.updatedAt === "number" ? task.updatedAt : now,
+    // A hand-edited or corrupt position would sort as NaN and scramble the whole list.
+    // Dropping it falls back to the ID, which is the order a pre-order store already had.
+    order: typeof task.order === "number" && Number.isFinite(task.order) ? task.order : undefined,
   };
 }
 
@@ -183,6 +186,7 @@ export class TaskStore {
           metadata: item.metadata ?? {},
           blocks: [],
           blockedBy: [],
+          order: this.nextOrder(),
           createdAt: now,
           updatedAt: now,
         };

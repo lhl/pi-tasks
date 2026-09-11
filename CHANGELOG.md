@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TaskList` lists open tasks in run order, marks the one that runs next, and states why it was
   chosen; it reports a fully blocked list rather than showing no next task. `TaskGet` reports a
   task's own position, and `TaskReorder` reports which task actually runs after the move.
+
+### Fixed
+- `TaskCreateMany` assigns run-order positions like `TaskCreate`. Bulk-created tasks previously
+  carried no position and sorted only by the ID fallback.
+- A stored `order` that is not a usable position is ignored rather than sorting as `NaN`, which
+  silently scrambled the whole list. Such a task falls back to its ID.
 - Generated task-continuation prompts render as one-line task labels when the host supports display-only Markdown transformers. The model still receives the full task prompt.
 - Global defaults load from `<agent-dir>/tasks-config.json`; project settings remain per-key overrides.
 - The optional `session-global` scope keeps new per-session task files under Pi's agent directory instead of the workspace.
