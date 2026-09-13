@@ -22,6 +22,7 @@ function mockCtx(cwd: string, sessionId = "s1", persisted = true) {
     cwd,
     sessionManager: {
       getSessionId: () => sessionId,
+      getBranch: () => [],
       getSessionFile: () => persisted ? join(cwd, `${sessionId}.jsonl`) : undefined,
     },
     model: { id: "test-model", name: "Test" },
@@ -41,6 +42,8 @@ function mockPi() {
   const tools = new Map<string, any>();
   const lifecycleHandlers = new Map<string, ((...args: any[]) => any)[]>();
   const pi = {
+    registerMessageRenderer: vi.fn(),
+    appendEntry: vi.fn(),
     registerTool(def: any) { tools.set(def.name, def); },
     registerCommand() {},
     registerMarkdownTransformer() {},

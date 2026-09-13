@@ -18,9 +18,12 @@ function mockCtx(overrides: {
   return {
     isIdle: overrides.isIdle ?? (() => true),
     cwd: overrides.cwd ?? process.cwd(),
-    sessionManager: overrides.sessionManager ?? {
-      getSessionId: () => "test-session",
-      getSessionFile: () => "/tmp/test-session.jsonl",
+    sessionManager: {
+      getBranch: () => [],
+      ...(overrides.sessionManager ?? {
+        getSessionId: () => "test-session",
+        getSessionFile: () => "/tmp/test-session.jsonl",
+      }),
     },
     model: { id: "test-model", name: "Test" },
     modelRegistry: {},
@@ -43,6 +46,8 @@ function mockPi() {
   const markdownTransformers: Array<(markdown: string, context: { messageType: string }) => string> = [];
 
   const pi = {
+    registerMessageRenderer: vi.fn(),
+    appendEntry: vi.fn(),
     registerTool(def: any) { tools.set(def.name, def); },
     registerCommand(name: string, def: any) { commands.set(name, def); },
     registerMarkdownTransformer(transformer: (markdown: string, context: { messageType: string }) => string) {
@@ -65,7 +70,7 @@ function mockPi() {
         };
       },
     },
-    sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
   };
 
   return {
@@ -150,13 +155,13 @@ describe("TaskExecute prompt injection", () => {
 
     expect(result.content[0].text).toContain("Scheduled 1 task");
     expect(result.content[0].text).toContain("#1 → scheduled");
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
 
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledWith(
-      expect.stringContaining("Continue by working on task #1"),
-      { deliverAs: "followUp" },
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "pi-tasks:continuation", content: expect.stringContaining("Continue by working on task #1") }),
+      { deliverAs: "followUp", triggerTurn: true },
     );
 
     const task = await mock.executeTool("TaskGet", { taskId: "1" });
@@ -186,13 +191,13 @@ describe("TaskExecute prompt injection", () => {
     });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Focus on REST endpoints only");
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Focus on REST endpoints only");
   });
 
-  it("renders generated task prompts as one line without changing assistant text", async () => {
+  it("leaves user and assistant text unchanged when it resembles a task prompt", async () => {
     const prompt = "Continue by working on task #7: \"Run tests\"\n\nLong instructions";
 
-    expect(mock.transformMarkdown(prompt)).toBe("Task #7 · Run tests");
+    expect(mock.transformMarkdown(prompt)).toBe(prompt);
     expect(mock.transformMarkdown(prompt, "assistant")).toBe(prompt);
   });
 
@@ -206,19 +211,19 @@ describe("TaskExecute prompt injection", () => {
     await mock.executeTool("TaskExecute", { task_ids: ["1", "2"] });
 
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("task #1");
 
-    const firstPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    const firstPrompt = mock.pi.sendMessage.mock.calls[0][0];
     await mock.fireLifecycle("message_start", {
-      message: { role: "user", content: [{ type: "text", text: firstPrompt }] },
+      message: { role: "custom", ...firstPrompt },
     }, mockCtx());
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
 
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(mock.pi.sendUserMessage.mock.calls[1][0]).toContain("task #2");
+    expect(mock.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(mock.pi.sendMessage.mock.calls[1][0].content).toContain("task #2");
   });
 
   it("does not release a later explicit task while the active task is open", async () => {
@@ -231,13 +236,13 @@ describe("TaskExecute prompt injection", () => {
     await mock.executeTool("TaskExecute", { task_ids: ["1", "2"] });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    const firstPrompt = mock.pi.sendUserMessage.mock.calls[0][0] as string;
+    const firstPrompt = mock.pi.sendMessage.mock.calls[0][0];
     await mock.fireLifecycle("message_start", {
-      message: { role: "user", content: [{ type: "text", text: firstPrompt }] },
+      message: { role: "custom", ...firstPrompt },
     }, mockCtx());
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
   });
 
   it("rejects non-existent, completed, and blocked tasks", async () => {
@@ -252,7 +257,7 @@ describe("TaskExecute prompt injection", () => {
     expect(text).toContain("#1: already completed");
     expect(text).toContain("#3: blocked by #2");
     expect(text).toContain("#999: not found");
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("TaskOutput reports prompt-queued task status without a background process", async () => {
@@ -363,12 +368,12 @@ describe("Auto-continue with prompts", () => {
 
     // Completing a task never injects mid-run; the run boundary owns that.
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
 
     // With no configuration at all the list advances rather than stopping.
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #2");
   });
 
   it("stops advancing when auto mode is turned off", async () => {
@@ -380,7 +385,7 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskCreate", { subject: "B", description: "Desc" });
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("keeps advancing while the task changes, and gives up once it stops changing", async () => {
@@ -390,11 +395,11 @@ describe("Auto-continue with prompts", () => {
 
     const advance = async () => {
       await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-      const calls = mock.pi.sendUserMessage.mock.calls;
-      const prompt = calls[calls.length - 1]?.[0] as string | undefined;
+      const calls = mock.pi.sendMessage.mock.calls;
+      const prompt = calls[calls.length - 1]?.[0];
       if (prompt) {
         await mock.fireLifecycle("message_start", {
-          message: { role: "user", content: [{ type: "text", text: prompt }] },
+          message: { role: "custom", ...prompt },
         }, mockCtx());
       }
       return calls.length;
@@ -410,9 +415,9 @@ describe("Auto-continue with prompts", () => {
     expect(sent).toBe(6);
 
     // Once nothing about the task changes, it is dropped after the attempt budget.
-    const before = mock.pi.sendUserMessage.mock.calls.length;
+    const before = mock.pi.sendMessage.mock.calls.length;
     for (let round = 0; round < 5; round++) await advance();
-    expect(mock.pi.sendUserMessage.mock.calls.length - before).toBe(3);
+    expect(mock.pi.sendMessage.mock.calls.length - before).toBe(3);
   });
 
   it("queues the next unblocked task after completion when enabled", async () => {
@@ -431,11 +436,11 @@ describe("Auto-continue with prompts", () => {
     });
 
     expect(result.content[0].text).not.toContain("queued follow-up prompt");
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
 
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    const prompt = mock.pi.sendUserMessage.mock.calls[0][0];
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    const prompt = mock.pi.sendMessage.mock.calls[0][0].content;
     expect(prompt).toContain("Continue by working on task #2");
     expect(prompt).toContain("Prerequisite task results");
     expect(prompt).toContain("The answer is 42");
@@ -449,8 +454,8 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskCreate", { subject: "Open task", description: "Do it" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #1");
   });
 
   it("does not queue a duplicate prompt while one is already queued", async () => {
@@ -462,7 +467,7 @@ describe("Auto-continue with prompts", () => {
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
   });
 
   it("queues nothing when cascade tasks all finish in the same agent run", async () => {
@@ -476,9 +481,9 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
     await mock.executeTool("TaskUpdate", { taskId: "2", status: "completed" });
 
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("drops an explicit task completed before the run boundary", async () => {
@@ -490,7 +495,7 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("drops an explicit task deleted before the run boundary", async () => {
@@ -502,7 +507,7 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "deleted" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("can retry a delivered prompt for still-open work, capped per task", async () => {
@@ -515,16 +520,16 @@ describe("Auto-continue with prompts", () => {
     let delivered = 0;
     for (let i = 0; i < 4; i++) {
       await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-      if (mock.pi.sendUserMessage.mock.calls.length > delivered) {
-        const prompt = mock.pi.sendUserMessage.mock.calls[delivered][0] as string;
+      if (mock.pi.sendMessage.mock.calls.length > delivered) {
+        const prompt = mock.pi.sendMessage.mock.calls[delivered][0];
         delivered++;
         await mock.fireLifecycle("message_start", {
-          message: { role: "user", content: [{ type: "text", text: prompt }] },
+          message: { role: "custom", ...prompt },
         }, mockCtx());
       }
     }
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(mock.pi.sendMessage).toHaveBeenCalledTimes(3);
   });
 
   it("legacy autoCascade:true config still enables cascade mode", async () => {
@@ -535,7 +540,7 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskCreate", { subject: "A", description: "Do it" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
   });
 
   it("autoMode:cascade behaves like the legacy cascade setting", async () => {
@@ -546,7 +551,7 @@ describe("Auto-continue with prompts", () => {
     await mock.executeTool("TaskCreate", { subject: "A", description: "Do it" });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
   });
 });
 
@@ -586,8 +591,8 @@ describe("Auto mode (interactive)", () => {
     const detail1 = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(detail1.content[0].text).toContain("Status: completed");
 
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #2");
   });
 
   it("re-queues the same task when the user picks Continue", async () => {
@@ -605,8 +610,8 @@ describe("Auto mode (interactive)", () => {
     await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
 
     // Should have re-queued task #1
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #1");
 
     // Task is still in_progress
     const detail = await mock.executeTool("TaskGet", { taskId: "1" });
@@ -627,7 +632,7 @@ describe("Auto mode (interactive)", () => {
 
     await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
 
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledWith("Auto mode stopped.", "info");
     expect((await readConfig()).autoMode).toBe("off");
   });
@@ -663,8 +668,8 @@ describe("Auto mode (interactive)", () => {
     await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
 
     expect(selectMock).not.toHaveBeenCalled();
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #1");
   });
 
   it("skips blocked in_progress tasks", async () => {
@@ -685,8 +690,8 @@ describe("Auto mode (interactive)", () => {
 
     // Should NOT ask about blocked task #2; should queue #1 (the only unblocked task)
     expect(selectMock).not.toHaveBeenCalled();
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #1");
   });
 });
 
@@ -714,8 +719,8 @@ describe("/tasks auto command", () => {
 
     expect((await readConfig()).autoMode).toBe("auto");
     // Task is pending, no in_progress task, so a follow-up should be queued immediately.
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #1");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #1");
   });
 
   it.each([
@@ -741,18 +746,18 @@ describe("/tasks auto command", () => {
     await mock.commands.get("tasks")!.handler(command === "menu" ? "" : command, ctx);
 
     expect((await readConfig()).autoMode).toBe(mode);
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
     expect(ctx.ui.notify).not.toHaveBeenCalled();
     expect(ctx.ui.select).toHaveBeenCalledTimes(command === "menu" ? 1 : 0);
     const active = await mock.executeTool("TaskGet", { taskId: "1" }, ctx);
     expect(active.content[0].text).toContain("Status: in_progress");
 
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "completed" }, ctx);
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
     idle = true;
     await mock.fireLifecycle("agent_end", { messages: [] }, ctx);
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
-    expect(mock.pi.sendUserMessage.mock.calls[0][0]).toContain("Continue by working on task #2");
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage.mock.calls[0][0].content).toContain("Continue by working on task #2");
     expect(ctx.ui.select).toHaveBeenCalledTimes(command === "menu" ? 1 : 0);
     await mock.fireLifecycle("session_shutdown", { reason: "quit" }, ctx);
   });
@@ -769,7 +774,7 @@ describe("/tasks auto command", () => {
     const config = await readConfig();
     expect(config.autoMode).toBe("off");
     expect(config.autoCascade).toBeUndefined();
-    expect(mock.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(mock.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("/tasks auto cascade switches to cascade mode", async () => {
@@ -783,7 +788,7 @@ describe("/tasks auto command", () => {
     await handler("auto cascade", ctx);
 
     expect((await readConfig()).autoMode).toBe("cascade");
-    expect(mock.pi.sendUserMessage).toHaveBeenCalledOnce();
+    expect(mock.pi.sendMessage).toHaveBeenCalledOnce();
   });
 
   it("/tasks auto status reports the current mode without changing it", async () => {

@@ -21,6 +21,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "@sinclair/typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { installTaskContinuationGuard, taskContinuation } from "./task-continuation.js";
 import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { TaskStore } from "./task-store.js";
 import {
@@ -119,13 +120,6 @@ export default function (pi: ExtensionAPI) {
   const tracker = new ProcessTracker();
   const widget = new TaskWidget(store, cfg);
 
-  const registerMarkdownTransformer = (pi as any).registerMarkdownTransformer;
-  if (typeof registerMarkdownTransformer === "function") {
-    registerMarkdownTransformer.call(pi, (markdown: string, context: { messageType: string }) =>
-      context.messageType === "user" ? compactTaskPrompt(markdown) : markdown
-    );
-  }
-
   function onCorruptFile(filePath: string, error: unknown) {
     debug("corrupt task store", { filePath, error });
     latestCtx?.ui.notify(
@@ -170,30 +164,7 @@ export default function (pi: ExtensionAPI) {
       ?? tasks.find(t => t.status === "pending" && getOpenBlockers(t).length === 0);
   }
 
-  /** Return the task ID from a prompt produced by buildTaskPrompt(). */
-  function parseTaskPromptId(text: unknown): string | undefined {
-    if (typeof text !== "string") return undefined;
-    return text.match(/^Continue by working on task #(\d+):/)?.[1];
-  }
-
-  /** Render generated task continuations as one line without changing model context. */
-  function compactTaskPrompt(markdown: string): string {
-    const match = markdown.match(/^Continue by working on task #(\d+): "([^\n]+)"(?:\r?\n){2}/);
-    if (!match) return markdown;
-    return `Task #${match[1]} · ${match[2]}`;
-  }
-
-  function getMessageText(message: any): string | undefined {
-    if (typeof message?.content === "string") return message.content;
-    if (!Array.isArray(message?.content)) return undefined;
-    const text = message.content
-      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
-      .map((part: any) => part.text)
-      .join("\n");
-    return text || undefined;
-  }
-
-  /** Build a follow-up user prompt for work on a task.
+  /** Build the instruction carried by an automated task continuation.
    *  Injects completed dependency results when available so dependent tasks can build on prerequisites.
    */
   function buildTaskPrompt(task: Task, additionalContext?: string): string {
@@ -261,7 +232,7 @@ export default function (pi: ExtensionAPI) {
     const prompt = buildTaskPrompt(queuedTask, options.additionalContext);
 
     try {
-      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+      pi.sendMessage(taskContinuation(queuedTask, prompt), { deliverAs: "followUp", triggerTurn: true });
     } catch (err: any) {
       if (previousStatus === "pending") store.update(current.id, { status: "pending" });
       queuedTaskIds.delete(current.id);
@@ -490,31 +461,7 @@ export default function (pi: ExtensionAPI) {
   // ── Turn tracking for auto-clear and prompt execution ──
   let currentTurn = 0;
 
-  // A continuation queued at enqueue time can go stale before delivery: the model may complete
-  // the task during a later turn while the queued follow-up is still pending (observed 2026-09-14:
-  // two continuations ran for already-completed tasks). Abort the turn before it spends a model
-  // request on finished work. If the abort lands late, the model still sees completed state via
-  // TaskGet; the guard bounds the waste either way.
-  pi.on("message_start", async (event, ctx) => {
-    if (!ctx) return;
-    const msg = event.message as any;
-    if (msg?.role !== "user") return;
-    const text = Array.isArray(msg.content)
-      ? msg.content.filter((p: any) => p?.type === "text" && typeof p.text === "string").map((p: any) => p.text).join("\n")
-      : typeof msg.content === "string" ? msg.content : "";
-    const match = text.match(/^Continue by working on task #(\d+): "([^\n]+)"/);
-    if (!match) return;
-    initializeStoreForContext(ctx);
-    const task = store.get(match[1]);
-    // The subject must match too, so user-typed text that merely opens the same way is never aborted.
-    if (!task || task.status !== "completed" || task.subject !== match[2]) return;
-    try {
-      ctx.abort();
-    } catch (err: any) {
-      debug("stale-continuation abort failed", err?.message ?? err);
-    }
-    ctx.ui.notify(`Skipped stale continuation for completed task #${task.id}.`, "info");
-  });
+  installTaskContinuationGuard(pi, id => store.get(id), id => queuedTaskIds.delete(id));
 
   pi.on("turn_start", async (_event, ctx) => {
     currentTurn++;
@@ -576,23 +523,12 @@ export default function (pi: ExtensionAPI) {
     if (keepsTasks) autoClear.onRunEnded();
   });
 
-  // message_start is the delivery-time signal for queued prompts. The input
-  // event fires when sendUserMessage enqueues them, which is too early.
-  pi.on("message_start", async (event) => {
-    if ((event.message as any)?.role !== "user") return;
-    const deliveredTaskId = parseTaskPromptId(getMessageText(event.message));
-    if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
-  });
-
   // Fallback for hosts that initialize extension UI lazily.
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", async (_event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     initializeStoreForContext(ctx);
     showPersistedTasks();
-
-    const deliveredTaskId = parseTaskPromptId(event.prompt);
-    if (deliveredTaskId) queuedTaskIds.delete(deliveredTaskId);
   });
 
   pi.on("agent_start", async () => {
