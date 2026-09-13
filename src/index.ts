@@ -490,6 +490,32 @@ export default function (pi: ExtensionAPI) {
   // ── Turn tracking for auto-clear and prompt execution ──
   let currentTurn = 0;
 
+  // A continuation queued at enqueue time can go stale before delivery: the model may complete
+  // the task during a later turn while the queued follow-up is still pending (observed 2026-09-14:
+  // two continuations ran for already-completed tasks). Abort the turn before it spends a model
+  // request on finished work. If the abort lands late, the model still sees completed state via
+  // TaskGet; the guard bounds the waste either way.
+  pi.on("message_start", async (event, ctx) => {
+    if (!ctx) return;
+    const msg = event.message as any;
+    if (msg?.role !== "user") return;
+    const text = Array.isArray(msg.content)
+      ? msg.content.filter((p: any) => p?.type === "text" && typeof p.text === "string").map((p: any) => p.text).join("\n")
+      : typeof msg.content === "string" ? msg.content : "";
+    const match = text.match(/^Continue by working on task #(\d+): "([^\n]+)"/);
+    if (!match) return;
+    initializeStoreForContext(ctx);
+    const task = store.get(match[1]);
+    // The subject must match too, so user-typed text that merely opens the same way is never aborted.
+    if (!task || task.status !== "completed" || task.subject !== match[2]) return;
+    try {
+      ctx.abort();
+    } catch (err: any) {
+      debug("stale-continuation abort failed", err?.message ?? err);
+    }
+    ctx.ui.notify(`Skipped stale continuation for completed task #${task.id}.`, "info");
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     currentTurn++;
     latestCtx = ctx;
