@@ -86,6 +86,25 @@ describe("continuation identity and cancellation", () => {
       expect(result.messages.at(-1)).toEqual(other);
       expect(result.messages[1].content).toContain("cancelled");
     });
+  it("returns cancellation context and reports failure when abort throws", async () => {
+    const f = fixture();
+    const own = message();
+    const before = structuredClone(own);
+    f.setTask(task("completed"));
+    f.ctx.abort.mockImplementation(() => { throw new Error("host abort failed"); });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await f.fire("message_start", { message: own });
+      const result = await f.fire("context", { messages: [own] });
+      expect(result.messages[0]).toEqual(before);
+      expect(result.messages[1].content).toContain("is cancelled");
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning.mock.calls[0][0]).toContain("Could not stop");
+      expect(f.pi.appendEntry).toHaveBeenCalledOnce();
+    } finally {
+      warning.mockRestore();
+    }
+  });
   it("does not abort a live task and retires only the delivered queue identity", async () => {
     const f = fixture();
     const own = message();

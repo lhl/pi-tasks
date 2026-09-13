@@ -79,7 +79,15 @@ export function installTaskContinuationGuard(
     incoming = [];
     // Wait until all inputs for this request are known: a user message or tool result
     // delivered alongside a stale continuation still needs its response.
-    if (stale && !live) ctx.abort();
+    if (stale && !live) {
+      try {
+        ctx.abort();
+      } catch {
+        // Pi catches handler failures and continues without their returned context.
+        // Keep the cancellation note even if the host cannot stop this request.
+        console.warn("pi-tasks: Could not stop the stale task turn. The model will receive a cancellation notice.");
+      }
+    }
     // Preserve source bytes for hosts that verify delivery receipts. A retained
     // cancellation note supersedes the stale instruction when other input needs a turn.
     return { messages: event.messages.flatMap((message): AgentMessage[] => {
