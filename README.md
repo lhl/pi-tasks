@@ -63,7 +63,7 @@ The extension renders a persistent widget above the editor:
 | `◻` | Pending |
 | `✳`/`✽` | Animated star spinner — actively executing task |
 
-Task duration counts only time inside Pi agent runs. Time spent waiting for the next user message is excluded. Set `maxVisible` to a positive integer and `collapseCompleted` to `true` under `/tasks` → Settings or in a task config file.
+Task duration counts only time inside Pi agent runs. Time spent waiting for the next user message is excluded. Set `maxVisible` to a positive integer and `collapseCompleted` to `true` under `/tasks` → Settings or in a task config file. Set `widgetVisible` to `false` to hide the panel without pausing tasks, changing auto-advance, or stopping execution statistics.
 
 ## Tools
 
@@ -230,7 +230,13 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 
 Task and project-config paths follow the active session's workspace rather than the process launch directory. Under `session-global`, an existing workspace file for the same session remains in use, so changing the setting does not move or strand tasks.
 
-Global defaults are read from `<agent-dir>/tasks-config.json`. Project overrides are saved to `<workspace>/.pi/tasks-config.json` and take precedence key by key. Supported settings are `taskScope`, `autoMode`, `autoClearCompleted`, `collapseCompleted`, and `maxVisible`. The legacy `autoCascade` setting still applies: `true` maps to `autoMode: "cascade"`, and `false` to `autoMode: "off"`.
+### Temporary widget suppression for extensions
+
+An extension that supplies its own task panel can suppress the native widget without writing the user's saved preference. After session initialization, emit `tasks:widget:claim` through `pi.events` with `{ version: 1, respond(release) { /* retain release */ } }`. The producer calls `respond` synchronously with an idempotent release function. No response means this interface is unavailable; do not assume the native widget was hidden.
+
+Call the release function when detaching. The native widget returns only after all claims are released and only if the current saved `widgetVisible` setting permits it. Claims end at session replacement or shutdown. Listen for `tasks:widget:ready` to acquire a fresh claim after session initialization, including when the producer initializes after your extension. This interface controls presentation only; it is not an activity inventory or an acknowledgment of task results.
+
+Global defaults are read from `<agent-dir>/tasks-config.json`. Project overrides are saved to `<workspace>/.pi/tasks-config.json` and take precedence key by key. Supported settings are `taskScope`, `autoMode`, `autoClearCompleted`, `widgetVisible`, `collapseCompleted`, and `maxVisible`. The legacy `autoCascade` setting still applies: `true` maps to `autoMode: "cascade"`, and `false` to `autoMode: "off"`.
 
 ### Auto-clear completed tasks
 

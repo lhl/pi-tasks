@@ -26,6 +26,7 @@ export interface TasksConfig {
    */
   autoMode?: AutoMode;
   autoClearCompleted?: "never" | "on_list_complete" | "on_task_complete";  // default: "on_list_complete"
+  widgetVisible?: boolean;     // default: true; affects presentation only
   collapseCompleted?: boolean;  // default: false
   maxVisible?: number;          // default: 10
 }

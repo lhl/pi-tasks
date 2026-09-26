@@ -103,6 +103,26 @@ export class TaskWidget {
   private tui: any | undefined;
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
+  private suppressionTokens = new Set<symbol>();
+
+  /** Hide the native widget until all callers release their temporary claims. */
+  suppress(): () => void {
+    const token = Symbol();
+    this.suppressionTokens.add(token);
+    try {
+      this.update();
+    } catch (error) {
+      this.suppressionTokens.delete(token);
+      throw error;
+    }
+    return () => {
+      if (this.suppressionTokens.delete(token)) this.update();
+    };
+  }
+
+  private isVisible(): boolean {
+    return this.config.widgetVisible !== false && this.suppressionTokens.size === 0;
+  }
 
   constructor(
     private store: TaskStore,
@@ -298,6 +318,7 @@ export class TaskWidget {
 
   /** Ensure the widget update timer is running and owns spinner advancement. */
   ensureTimer() {
+    if (!this.isVisible()) return;
     if (!this.widgetInterval) {
       this.widgetInterval = setInterval(() => {
         this.widgetFrame++;
@@ -422,7 +443,7 @@ export class TaskWidget {
     this.syncTrackedTasks(tasks);
 
     // Transition: visible → hidden
-    if (tasks.length === 0) {
+    if (tasks.length === 0 || !this.isVisible()) {
       if (this.widgetRegistered) {
         this.uiCtx.setWidget("tasks", undefined);
         this.widgetRegistered = false;
@@ -477,5 +498,6 @@ export class TaskWidget {
     }
     this.widgetRegistered = false;
     this.tui = undefined;
+    this.suppressionTokens.clear();
   }
 }

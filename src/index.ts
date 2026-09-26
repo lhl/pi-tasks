@@ -34,6 +34,7 @@ import {
 import { isCompletedTaskExecutionStats, isTaskExecutionStats, type Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
+import { installTaskWidgetVisibility, TASK_WIDGET_READY } from "./widget-visibility.js";
 
 // ---- Debug ----
 
@@ -119,6 +120,7 @@ export default function (pi: ExtensionAPI) {
   let store = new TaskStore(storeTarget.path);
   const tracker = new ProcessTracker();
   const widget = new TaskWidget(store, cfg);
+  let disposeWidgetVisibility: (() => void) | undefined;
 
   function onCorruptFile(filePath: string, error: unknown) {
     debug("corrupt task store", { filePath, error });
@@ -486,6 +488,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown" as any, async () => {
     widget.dispose();
+    disposeWidgetVisibility?.();
+    disposeWidgetVisibility = undefined;
     latestCtx = undefined;
   });
 
@@ -498,6 +502,8 @@ export default function (pi: ExtensionAPI) {
   // Initialize and restore task state before the first user prompt. Pi emits
   // session_start for startup, reload, new, resume, and fork transitions.
   pi.on("session_start", async (event, ctx) => {
+    disposeWidgetVisibility?.();
+    disposeWidgetVisibility = undefined;
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
 
@@ -521,6 +527,8 @@ export default function (pi: ExtensionAPI) {
     const keepsTasks = reason === "reload" || reason === "resume" || reason === "fork";
     showPersistedTasks(keepsTasks);
     if (keepsTasks) autoClear.onRunEnded();
+    disposeWidgetVisibility = installTaskWidgetVisibility(pi.events, widget);
+    pi.events.emit(TASK_WIDGET_READY, { version: 1 });
   });
 
   // Fallback for hosts that initialize extension UI lazily.

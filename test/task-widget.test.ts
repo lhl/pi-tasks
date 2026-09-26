@@ -61,6 +61,59 @@ describe("TaskWidget", () => {
     vi.useRealTimers();
   });
 
+  it("temporary suppression preserves preferences and keeps timing without animation", () => {
+    store.create("Working", "Desc");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1");
+    widget.onAgentStart();
+    const release = widget.suppress();
+    expect(renderWidget(ui.state)).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(2000);
+    widget.addTokenUsage(10, 20);
+    widget.onAgentEnd();
+    expect(store.get("1")?.metadata.executionStats).toMatchObject({ durationMs: 2000, inputTokens: 10, outputTokens: 20 });
+    expect(store.get("1")?.status).toBe("in_progress");
+    release();
+    expect(renderWidget(ui.state).join("\n")).toContain("Working");
+    release();
+    expect(renderWidget(ui.state)).toHaveLength(2);
+  });
+
+  it("all temporary claims must release and the current saved preference still applies", () => {
+    widget.dispose();
+    const config = { widgetVisible: true };
+    widget = new TaskWidget(store, config);
+    widget.setUICtx(ui.ctx);
+    store.create("Queued", "Desc");
+    const first = widget.suppress();
+    const second = widget.suppress();
+    first();
+    expect(renderWidget(ui.state)).toEqual([]);
+    expect(config.widgetVisible).toBe(true);
+    config.widgetVisible = false;
+    second();
+    expect(renderWidget(ui.state)).toEqual([]);
+    config.widgetVisible = true;
+    widget.update();
+    expect(renderWidget(ui.state)).toHaveLength(2);
+  });
+
+  it("saved hiding prevents initial registration and stale release cannot revive a disposed widget", () => {
+    widget.dispose();
+    widget = new TaskWidget(store, { widgetVisible: false });
+    widget.setUICtx(ui.ctx);
+    store.create("Queued", "Desc");
+    widget.update();
+    expect(renderWidget(ui.state)).toEqual([]);
+    const release = widget.suppress();
+    widget.dispose();
+    const setWidget = vi.spyOn(ui.ctx, "setWidget");
+    release();
+    expect(setWidget).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("shows nothing when no tasks exist", () => {
     widget.update();
     const entry = ui.state.widgets.get("tasks");

@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,6 +42,7 @@ function mockCtx(cwd: string, sessionId = "s1", persisted = true) {
 function mockPi() {
   const tools = new Map<string, any>();
   const lifecycleHandlers = new Map<string, ((...args: any[]) => any)[]>();
+  const bus = new EventEmitter();
   const pi = {
     registerMessageRenderer: vi.fn(),
     appendEntry: vi.fn(),
@@ -51,7 +53,13 @@ function mockPi() {
       if (!lifecycleHandlers.has(event)) lifecycleHandlers.set(event, []);
       lifecycleHandlers.get(event)!.push(handler);
     },
-    events: { emit() {}, on() { return () => {}; } },
+    events: {
+      emit(event: string, data: unknown) { bus.emit(event, data); },
+      on(event: string, handler: (data: unknown) => void) {
+        bus.on(event, handler);
+        return () => { bus.off(event, handler); };
+      },
+    },
     sendUserMessage: vi.fn(),
   };
   return {
@@ -86,6 +94,33 @@ afterEach(() => {
 });
 
 describe("workspace-aware task storage", () => {
+  it("renews native-widget claims on session changes and releases them on shutdown", async () => {
+    config.current = { taskScope: "project", widgetVisible: true };
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    const ctx = mockCtx(cwd);
+    let release!: () => void;
+    mock.pi.events.on("tasks:widget:ready", () => {
+      mock.pi.events.emit("tasks:widget:claim", { version: 1, respond(value: () => void) { release = value; } });
+    });
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+    await mock.executeTool("TaskCreate", { subject: "Shared", description: "d" }, ctx);
+    expect(ctx.ui.setWidget.mock.calls.some((args: any[]) => args[1] !== undefined)).toBe(false);
+    const oldRelease = release;
+    await mock.fireLifecycle("session_start", { reason: "resume" }, ctx);
+    expect(release).not.toBe(oldRelease);
+    ctx.ui.setWidget.mockClear();
+    oldRelease();
+    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+    release();
+    expect(ctx.ui.setWidget.mock.lastCall?.[1]).toBeTypeOf("function");
+    await mock.fireLifecycle("session_shutdown", {}, ctx);
+    const respond = vi.fn();
+    mock.pi.events.emit("tasks:widget:claim", { version: 1, respond });
+    expect(respond).not.toHaveBeenCalled();
+    expect(config.current.widgetVisible).toBe(true);
+  });
+
   it("persists project tasks under the session workspace", async () => {
     config.current = { taskScope: "project" };
     const mock = mockPi();

@@ -54,6 +54,13 @@ export async function openSettingsMenu(
         values: ["off", "cascade", "auto"],
       },
       {
+        id: "widgetVisible",
+        label: "Show task widget",
+        description: "Show the task panel above the editor. Hiding it does not pause tasks or change auto-advance.",
+        currentValue: cfg.widgetVisible === false ? "off" : "on",
+        values: ["on", "off"],
+      },
+      {
         id: "collapseCompleted",
         label: "Collapse completed tasks",
         description:
@@ -100,6 +107,10 @@ export async function openSettingsMenu(
         }
         if (id === "autoClearCompleted") {
           cfg.autoClearCompleted = newValue as TasksConfig["autoClearCompleted"];
+          saveTasksConfig(cfg, cwd);
+        }
+        if (id === "widgetVisible") {
+          cfg.widgetVisible = newValue === "on";
           saveTasksConfig(cfg, cwd);
         }
         if (id === "collapseCompleted") {
