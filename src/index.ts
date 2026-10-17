@@ -196,7 +196,7 @@ export default function (pi: ExtensionAPI) {
       `- Use TaskGet if you need to refresh details for task #${task.id}.\n` +
       `- Mark task #${task.id} in_progress before doing substantive work if it is not already in progress.\n` +
       `- When finished, call TaskUpdate with status completed. Include a concise metadata.result summary if it would help dependent tasks.\n` +
-      `- If you cannot complete it, leave the task open and explain the blocker.`;
+      `- If another task blocks this task, use addBlockedBy and leave it open. If this task is no longer relevant, mark it deleted. Otherwise leave it in_progress and explain what remains.`;
     return prompt;
   }
 
@@ -916,8 +916,10 @@ Returns full task details:
 - After resolving, call TaskList to find your next task
 
 - ONLY mark a task as completed when you have FULLY accomplished it
-- If you encounter errors, blockers, or cannot finish, keep the task as in_progress
-- When blocked, create a new task describing what needs to be resolved
+- If you encounter errors or cannot finish, do not mark the task completed
+- If another task blocks this task, use addBlockedBy and leave it open
+- If this task is no longer relevant or has been superseded, mark it deleted
+- In cascade mode, an in_progress task is prompted again before pending tasks; do not leave it in_progress merely to report a status or write a next-steps list
 - Never mark a task as completed if:
   - Tests are failing
   - Implementation is partial
