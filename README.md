@@ -76,7 +76,6 @@ Create a structured task. Used proactively for complex multi-step work.
 | `subject` | string | yes | Brief imperative title |
 | `description` | string | yes | Detailed context and acceptance criteria |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., `Running tests`) |
-| `agentType` | string | no | Legacy compatibility hint; no longer required for execution |
 | `metadata` | object | no | Arbitrary key-value pairs |
 
 ### `TaskCreateMany`
@@ -89,7 +88,6 @@ Create multiple structured tasks in a single call. More efficient than repeated 
 | `tasks[].subject` | string | yes | Brief imperative title |
 | `tasks[].description` | string | yes | Detailed context and acceptance criteria |
 | `tasks[].activeForm` | string | no | Present continuous form for spinner |
-| `tasks[].agentType` | string | no | Legacy compatibility hint |
 | `tasks[].metadata` | object | no | Arbitrary key-value pairs |
 
 ```text

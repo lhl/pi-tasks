@@ -582,64 +582,23 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "TaskCreate",
     label: "TaskCreate",
-    description: `Use this tool to create a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
-It also helps the user understand the progress of the task and overall progress of their requests.
-
-## When to Use This Tool
-
-Use this tool proactively in these scenarios:
-
-- Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
-- Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
-- Plan mode - When using plan mode, create a task list to track the work
-- User explicitly requests todo list - When the user directly asks you to use the todo list
-- User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)
-- After receiving new instructions - Immediately capture user requirements as tasks
-- When you start working on a task - Mark it as in_progress BEFORE beginning work
-- After completing a task - Mark it as completed and add any new follow-up tasks discovered during implementation
-
-## When NOT to Use This Tool
-
-Skip using this tool when:
-- There is only a single, straightforward task
-- The task is trivial and tracking it provides no organizational benefit
-- The task can be completed in less than 3 trivial steps
-- The task is purely conversational or informational
-
-NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
-
-## Task Fields
-
-- **subject**: A brief, actionable title in imperative form (e.g., "Fix authentication bug in login flow")
-- **description**: Detailed description of what needs to be done, including context and acceptance criteria
-- **activeForm** (optional): Present continuous form shown in the spinner when the task is in_progress (e.g., "Fixing authentication bug"). If omitted, the spinner shows the subject instead.
-
-All tasks are created with status \`pending\`.
-
-## Tips
-
-- Create tasks with clear, specific subjects that describe the outcome
-- Include enough detail in the description for another agent to understand and complete the task
-- After creating tasks, use TaskUpdate to set up dependencies (blocks/blockedBy) if needed
-- Check TaskList first to avoid creating duplicate tasks
-- The legacy \`agentType\` field is accepted for compatibility but TaskExecute now queues prompts in the current session`,
+    description: `Create one task in the session task list. Track tasks for work with three or more distinct steps or when the user asks for a task list; skip tracking for single-step or conversational requests. Use TaskCreateMany when several tasks are known. New tasks start pending. Write the subject as an imperative outcome and put acceptance criteria in the description.`,
     promptGuidelines: [
-      "When working on complex multi-step tasks, use TaskCreate to track progress and TaskUpdate to update status.",
-      "Mark tasks as in_progress before starting work and completed when done.",
-      "Use TaskList to check for available work after completing a task.",
+      "Mark a task in_progress before starting it and completed only after its work and checks are done.",
     ],
     parameters: Type.Object({
       subject: Type.String({ description: "A brief title for the task" }),
       description: Type.String({ description: "A detailed description of what needs to be done" }),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress (e.g., 'Running tests')" })),
-      agentType: Type.Optional(Type.String({ description: "Legacy compatibility hint. Prompt execution no longer requires an agent type." })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
     }),
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       autoClear.startNewBatch();
       const meta = params.metadata ?? {};
-      if (params.agentType) meta.agentType = params.agentType;
+      // Older callers may still send the removed agentType hint; keep it as metadata.
+      const { agentType } = params as { agentType?: string };
+      if (agentType) meta.agentType = agentType;
       const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined);
       widget.update();
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
@@ -653,43 +612,13 @@ All tasks are created with status \`pending\`.
   pi.registerTool({
     name: "TaskCreateMany",
     label: "TaskCreateMany",
-    description: `Use this tool to create multiple structured tasks in a single call. Prefer this over repeated TaskCreate calls when you know all tasks upfront.
-
-## When to Use This Tool
-
-- When planning a multi-step effort and all tasks are known at once
-- When the user provides a list of things to be done (numbered or comma-separated)
-- When you want to batch-create tasks without repeated round-trips
-
-## When NOT to Use This Tool
-
-Skip using this tool when:
-- You only have one task to create (use TaskCreate instead)
-- The task list depends on the output of prior work
-
-## Task Fields (per item)
-
-- **subject**: A brief, actionable title in imperative form
-- **description**: Detailed description of what needs to be done
-- **activeForm** (optional): Present continuous form for the spinner (e.g., "Fixing bug")
-- **agentType** (optional): Legacy compatibility hint; prompt execution no longer requires it
-- **metadata** (optional): Arbitrary key-value pairs
-
-## Tips
-
-- Use TaskUpdate afterwards to set up dependencies (blocks/blockedBy) between the created tasks
-- IDs are assigned sequentially in the order tasks appear in the array`,
-    promptGuidelines: [
-      "Use TaskCreateMany when you have multiple tasks to create at once — it is more efficient than calling TaskCreate in a loop.",
-      "After bulk creation, use TaskUpdate to wire up any blocks/blockedBy dependencies between tasks.",
-    ],
+    description: `Create several tasks in one call. IDs and run order follow the array order. Add dependencies afterwards with TaskUpdate addBlockedBy.`,
     parameters: Type.Object({
       tasks: Type.Array(
         Type.Object({
           subject: Type.String({ description: "A brief title for the task" }),
           description: Type.String({ description: "A detailed description of what needs to be done" }),
           activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress" })),
-          agentType: Type.Optional(Type.String({ description: "Legacy compatibility hint. Prompt execution no longer requires an agent type." })),
           metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
         }),
         { description: "Array of tasks to create", minItems: 1 },
@@ -700,7 +629,8 @@ Skip using this tool when:
       autoClear.startNewBatch();
       const items = params.tasks.map(t => {
         const meta = t.metadata ?? {};
-        if (t.agentType) meta.agentType = t.agentType;
+        const { agentType } = t as { agentType?: string };
+        if (agentType) meta.agentType = agentType;
         return {
           subject: t.subject,
           description: t.description,
@@ -725,26 +655,7 @@ Skip using this tool when:
   pi.registerTool({
     name: "TaskList",
     label: "TaskList",
-    description: `Use this tool to list all tasks in the task list.
-
-## When to Use This Tool
-
-- To see what tasks are available to work on (status: 'pending', no owner, not blocked)
-- To check overall progress on the project
-- To find tasks that are blocked and need dependencies resolved
-- After completing a task, to check for newly unblocked work or claim the next available task
-- **Prefer working on tasks in ID order** (lowest ID first) when multiple tasks are available, as earlier tasks often set up context for later ones
-
-## Output
-
-Returns a summary of each task:
-- **id**: Task identifier (use with TaskGet, TaskUpdate)
-- **subject**: Brief description of the task
-- **status**: 'pending', 'in_progress', or 'completed'
-- **owner**: Agent ID if assigned, empty if available
-- **blockedBy**: List of open task IDs that must be resolved first (tasks with blockedBy cannot be claimed until dependencies resolve). A blocked task is skipped by auto-advance, not waited for: the next unblocked task in run order runs instead.
-
-Use TaskGet with a specific task ID to view full details including description and comments.`,
+    description: `List tasks in run order with status, owner, and open blockers. The output marks the task that runs next and says why. Use TaskGet for a task's full description.`,
     parameters: Type.Object({}),
 
     execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -802,27 +713,7 @@ Use TaskGet with a specific task ID to view full details including description a
   pi.registerTool({
     name: "TaskGet",
     label: "TaskGet",
-    description: `Use this tool to retrieve a task by its ID from the task list.
-
-## When to Use This Tool
-
-- When you need the full description and context before starting work on a task
-- To understand task dependencies (what it blocks, what blocks it)
-- After being assigned a task, to get complete requirements
-
-## Output
-
-Returns full task details:
-- **subject**: Task title
-- **description**: Detailed requirements and context
-- **status**: 'pending', 'in_progress', or 'completed'
-- **blocks**: Tasks waiting on this one to complete
-- **blockedBy**: Tasks that must complete before this one can start
-
-## Tips
-
-- After fetching a task, verify its blockedBy list is empty before beginning work.
-- Use TaskList to see all tasks in summary form.`,
+    description: `Get one task's full description, status, run-order position, and dependencies (blocks and blockedBy).`,
     parameters: Type.Object({
       taskId: Type.String({ description: "The ID of the task to retrieve" }),
     }),
@@ -901,86 +792,14 @@ Returns full task details:
   pi.registerTool({
     name: "TaskUpdate",
     label: "TaskUpdate",
-    description: `Use this tool to update a task in the task list.
+    description: `Update a task's status, details, or dependencies.
 
-## When to Use This Tool
+- Set status in_progress before starting a task. Set completed only when its work is done and its checks pass; with failing tests, partial work, or unresolved errors, leave it open and say what remains.
+- In cascade mode, an in_progress task is prompted again before pending tasks; do not leave it in_progress just to report status.
+- Use addBlockedBy when another task must finish first. A description saying "blocked" does not stop auto-advance.
+- Set status deleted to remove a task permanently.
 
-**Before starting work on a task:**
-- Mark it in_progress BEFORE beginning — do not start work without updating status first
-- After resolving, call TaskList to find your next task
-
-**Mark tasks as resolved:**
-- When you have completed the work described in a task
-- When a task is no longer needed or has been superseded
-- IMPORTANT: Always mark your assigned tasks as resolved when you finish them
-- After resolving, call TaskList to find your next task
-
-- ONLY mark a task as completed when you have FULLY accomplished it
-- If you encounter errors or cannot finish, do not mark the task completed
-- If another task blocks this task, use addBlockedBy and leave it open
-- If this task is no longer relevant or has been superseded, mark it deleted
-- In cascade mode, an in_progress task is prompted again before pending tasks; do not leave it in_progress merely to report a status or write a next-steps list
-- Never mark a task as completed if:
-  - Tests are failing
-  - Implementation is partial
-  - You encountered unresolved errors
-  - You couldn't find necessary files or dependencies
-
-**Delete tasks:**
-- When a task is no longer relevant or was created in error
-- Setting status to \`deleted\` permanently removes the task
-
-**Update task details:**
-- When requirements change or become clearer
-- When establishing dependencies between tasks
-
-## Fields You Can Update
-
-- **status**: The task status (see Status Workflow below)
-- **subject**: Change the task title (imperative form, e.g., "Run tests")
-- **description**: Change the task description
-- **activeForm**: Present continuous form shown in spinner when in_progress (e.g., "Running tests")
-- **owner**: Change the task owner (agent name)
-- **metadata**: Merge metadata keys into the task (set a key to null to delete it)
-- **addBlocks**: Mark tasks that cannot start until this one completes
-- **addBlockedBy**: Mark tasks that must complete before this one can start
-
-## Status Workflow
-
-Status progresses: \`pending\` → \`in_progress\` → \`completed\`
-
-Use \`deleted\` to permanently remove a task.
-
-## Staleness
-
-Make sure to read a task's latest state using \`TaskGet\` before updating it.
-
-## Examples
-
-Mark task as in progress when starting work:
-\`\`\`json
-{"taskId": "1", "status": "in_progress"}
-\`\`\`
-
-Mark task as completed after finishing work:
-\`\`\`json
-{"taskId": "1", "status": "completed"}
-\`\`\`
-
-Delete a task:
-\`\`\`json
-{"taskId": "1", "status": "deleted"}
-\`\`\`
-
-Claim a task by setting owner:
-\`\`\`json
-{"taskId": "1", "owner": "my-name"}
-\`\`\`
-
-Set up task dependencies:
-\`\`\`json
-{"taskId": "2", "addBlockedBy": ["1"]}
-\`\`\``,
+Example: {"taskId": "2", "addBlockedBy": ["1"]}`,
     parameters: Type.Object({
       taskId: Type.String({ description: "The ID of the task to update" }),
       status: Type.Optional(Type.Unsafe<"pending" | "in_progress" | "completed" | "deleted">({
@@ -1041,45 +860,7 @@ Set up task dependencies:
   pi.registerTool({
     name: "TaskReorder",
     label: "TaskReorder",
-    description: `Use this tool to move a task to a different position in the run order.
-
-## When to Use This Tool
-
-Tasks run in list order, so the order decides what is worked on next. Reorder when:
-
-- You discover that one task should be done before another already on the list
-- A task turns out to be a prerequisite, but does not strictly block the other
-- You created tasks in the order you thought of them, not the order to do them
-
-## When NOT to Use This Tool
-
-- **One task genuinely cannot start until another finishes.** Use \`TaskUpdate\` with
-  \`addBlockedBy\` instead. A dependency is enforced; an order is only a preference.
-- To mark what you are working on now — use \`TaskUpdate\` with \`in_progress\`.
-
-## What decides the next task
-
-Run order is the last tie-breaker, not the first rule. In order of precedence:
-
-1. **A task already \`in_progress\` runs next**, whatever the order says. Moving a pending
-   task to the front will not preempt work already started.
-2. **Blocked tasks are skipped**, not waited for. A task with an open \`blockedBy\` entry is
-   passed over and the next unblocked task runs instead, wherever its blocker sits.
-3. **Among the rest, the first in run order wins.** That is what this tool changes.
-
-\`TaskList\` marks the task that runs next and says why, so read it rather than deriving it.
-
-## Examples
-
-Do task 5 before task 2:
-\`\`\`json
-{"taskId": "5", "before": "2"}
-\`\`\`
-
-Move task 1 to sit right after task 4:
-\`\`\`json
-{"taskId": "1", "after": "4"}
-\`\`\``,
+    description: `Move a task in the run order with exactly one of before or after. Order is a preference: a task already in_progress runs first, and blocked tasks are skipped. For a task that cannot start until another finishes, use TaskUpdate addBlockedBy. TaskList shows what runs next.`,
     parameters: Type.Object({
       taskId: Type.String({ description: "The ID of the task to move" }),
       before: Type.Optional(Type.String({ description: "Move the task to sit immediately before this task ID" })),
@@ -1123,13 +904,7 @@ Move task 1 to sit right after task 4:
   pi.registerTool({
     name: "TaskOutput",
     label: "TaskOutput",
-    description: `- Retrieves output from a running or completed task (background shell, agent, or remote session)
-- Takes a task_id parameter identifying the task
-- Returns the task output along with status information
-- Use block=true (default) to wait for task completion
-- Use block=false for non-blocking check of current status
-- Task IDs can be found using the /tasks command
-- Works with all task types: background shells, async agents, and remote sessions`,
+    description: `Get output from a task's background process. block=true (default) waits for completion up to timeout; block=false returns the current status. Prompt-queued tasks have no process; their work happens in the conversation.`,
     parameters: Type.Object({
       task_id: Type.String({ description: "The task ID to get output from" }),
       block: Type.Boolean({ description: "Whether to wait for completion", default: true }),
@@ -1177,11 +952,7 @@ ${String(task.metadata.result)}` : "";
   pi.registerTool({
     name: "TaskStop",
     label: "TaskStop",
-    description: `
-- Stops a running background task by its ID
-- Takes a task_id parameter identifying the task to stop
-- Returns a success or failure status
-- Use this tool when you need to terminate a long-running task`,
+    description: `Stop a task's running background process and mark the task completed.`,
     parameters: Type.Object({
       task_id: Type.Optional(Type.String({ description: "The ID of the background task to stop" })),
       shell_id: Type.Optional(Type.String({ description: "Deprecated: use task_id instead" })),
@@ -1219,21 +990,7 @@ ${String(task.metadata.result)}` : "";
   pi.registerTool({
     name: "TaskExecute",
     label: "TaskExecute",
-    description: `Schedule one or more tasks for sequential follow-up work in the current pi session.
-
-## When to Use This Tool
-
-- To start or resume task work without launching a separate agent
-- Tasks must be pending or in_progress with all blockedBy dependencies completed
-- The extension rechecks live task state at each agent boundary and releases at most one prompt
-
-## Parameters
-
-- **task_ids**: Ordered task IDs to schedule
-- **additional_context**: Extra context appended to each task prompt`,
-    promptGuidelines: [
-      "TaskExecute schedules sequential follow-up work in the current session; do not launch separate agents for these tasks.",
-    ],
+    description: `Queue pending or in_progress tasks, in the given order, as follow-up prompts in the current session; blocked tasks are skipped. Work happens in this session, not in separate agents. The next task starts after the current run ends, and live task state is rechecked before each prompt.`,
     parameters: Type.Object({
       task_ids: Type.Array(Type.String(), { description: "Ordered task IDs to schedule" }),
       additional_context: Type.Optional(Type.String({ description: "Extra context for task prompts" })),

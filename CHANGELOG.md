@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Shorten tool descriptions and system-prompt guidelines, which cuts the task tools' tool
+  definitions roughly in half. The descriptions no longer ask the model to create tasks for every
+  new instruction, and `TaskList` no longer recommends ID order, which contradicted run order.
+  `agentType` is no longer advertised in the `TaskCreate` and `TaskCreateMany` schemas; calls that
+  still send it keep it as task metadata.
+
 ### Added
 - `TaskReorder` moves a task before or after another in the run order. Auto-advance takes the first
   unblocked task in that order, so reordering decides what is worked on next. Positions renumber
